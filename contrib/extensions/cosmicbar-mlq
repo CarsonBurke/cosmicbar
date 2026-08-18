@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""cosmicbar extension: what the machine is training right now.
+
+Subscribes to mlqd (the mlqueue daemon) over its unix socket and draws a bar
+cell plus a popup with one row per live job, a cancel button on each, and a
+pause switch in the footer.
+
+This is the worked example for the extension protocol: it is push-driven
+(mlqd's `subscribe` op streams snapshots, so nothing here polls the queue), it
+uses the popup signal to decide how often the elapsed times on screen are
+refreshed, and it is deliberately written in Python with no third-party
+packages to show that an extension is just a program that speaks JSON lines on
+stdio.
+
+Protocol, both sides:
+  read  {"popup": true|false}          the bar's popup for this module
+  read  {"action": "<id>"}             a popup button was pressed
+  write {"cell": {...}, "popup": [...]} one frame; the bar draws exactly this
+
+See docs/extensions.md.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import socket
+import struct
+import sys
+import threading
+import time
+
+# Must match PROTOCOL_VERSION in mlqueue/src/protocol.rs.
+PROTOCOL_VERSION = 8
+# Mirrors the daemon's DEFAULT_MAX_FRAME_BYTES; a longer prefix is a desync.
+MAX_FRAME_BYTES = 1 << 20
+# Reconnect ladder for a daemon that is down or restarting.
+RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
+# A session that lasted this long was healthy: the next failure starts the
+# ladder over instead of inheriting an old outage's delay.
+STABLE_SESSION = 60.0
+# nf-md-graph-outline: a queue of learning runs.
+ICON = "\U000f1049"
+# Longest job name drawn in the bar before elision.
+NAME_LIMIT = 26
+# Elapsed times only move forwards, so a redraw with nothing else to say is
+# worth it exactly when the digit on screen turns over - see `cadence`. This is
+# only the floor on that wait, so a clock landing on a boundary cannot spin.
+MIN_TICK = 0.05
+
+
+def socket_path() -> str:
+    """Mirrors mlqueue's `Paths`: $XDG_RUNTIME_DIR/mlqueue/mlqd.sock."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return os.path.join(runtime, "mlqueue", "mlqd.sock")
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(state, "mlqueue", "runtime", "mlqd.sock")
+
+
+def request_id() -> str:
+    return f"cosmicbar-mlq-{os.getpid()}-{time.monotonic_ns()}"
+
+
+def write_frame(sock: socket.socket, body: bytes) -> None:
+    sock.sendall(struct.pack(">I", len(body)) + body)
+
+
+def read_frame(sock: socket.socket) -> bytes | None:
+    """`None` when the peer closed the connection between frames."""
+    header = read_exactly(sock, 4)
+    if header is None:
+        return None
+    (length,) = struct.unpack(">I", header)
+    if length > MAX_FRAME_BYTES:
+        raise ConnectionError(f"frame of {length} bytes: stream desync")
+    body = read_exactly(sock, length)
+    if body is None:
+        raise ConnectionError("connection closed mid-frame")
+    return body
+
+
+def read_exactly(sock: socket.socket, count: int) -> bytes | None:
+    """`None` for a clean close on a boundary; a partial read is a broken pipe."""
+    chunks = bytearray()
+    while len(chunks) < count:
+        chunk = sock.recv(count - len(chunks))
+        if not chunk:
+            if not chunks:
+                return None
+            raise ConnectionError("connection closed mid-frame")
+        chunks += chunk
+    return bytes(chunks)
+
+
+def request(op: dict, idempotency_key: str | None = None) -> dict:
+    """One request/response round trip on its own connection."""
+    body = {"protocol_version": PROTOCOL_VERSION, "request_id": request_id(), "op": op}
+    if idempotency_key is not None:
+        body["idempotency_key"] = idempotency_key
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5.0)
+        sock.connect(socket_path())
+        write_frame(sock, json.dumps(body).encode())
+        frame = read_frame(sock)
+    if frame is None:
+        raise ConnectionError("mlqd closed the connection without replying")
+    response = json.loads(frame)
+    if response.get("error"):
+        error = response["error"]
+        raise ConnectionError(f"{error.get('code')}: {error.get('message')}")
+    return response
+
+
+def elide(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def duration(ms: int) -> str:
+    """Compact wall clock: `42s`, `7m`, `3h12m`."""
+    seconds = max(ms, 0) // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def short_command(job: dict) -> str:
+    """Last path-looking parts of the argv, which is what identifies a run."""
+    return " ".join(arg.rsplit("/", 1)[-1] for arg in job.get("args", []))
+
+
+def live(status: dict) -> list[dict]:
+    return [job for job in status.get("jobs", []) if job.get("finishedAt") is None]
+
+
+def running(status: dict) -> list[dict]:
+    return [job for job in live(status) if job.get("state") == "running"]
+
+
+class Extension:
+    """The frame this program is currently drawing, and what feeds it."""
+
+    def __init__(self) -> None:
+        self.status: dict | None = None
+        self.connected = False
+        self.error: str | None = None
+        self.popup_open = False
+        # When each running job started, in local wall-clock milliseconds. Read
+        # once from `updatedAt` - the job's last state change, which for a run
+        # already going when this process attached is the closest thing to a
+        # start - and then never again: `updatedAt` is rewritten by unrelated
+        # mutations (a priority change, a limit change), and the `status` view
+        # carries no attempt start, so a reading taken from it live snaps back
+        # to zero for a non-event.
+        self.started: dict[int, int] = {}
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.last = ""
+        self.actions: queue.Queue[str] = queue.Queue()
+
+    # -- frame -------------------------------------------------------------
+
+    def elapsed_ms(self, job: dict, now_ms: int) -> int:
+        """How long this job has been running, as far as this process knows."""
+        started = self.started.get(job.get("id", -1), now_ms)
+        return max(now_ms - started, 0)
+
+    def note_starts(self, status: dict) -> None:
+        """Fix when each run began, and forget the ones that ended."""
+        now_ms = int(time.time() * 1000)
+        ids = set()
+        for job in running(status):
+            job_id = job.get("id", -1)
+            ids.add(job_id)
+            if job_id in self.started:
+                continue
+            updated = job.get("updatedAt")
+            # A clock that disagrees with this one, or a job whose last change
+            # was its queueing rather than its start, must not read as the
+            # future: this is a floor, not a correction.
+            self.started[job_id] = (
+                min(int(updated), now_ms) if isinstance(updated, (int, float)) else now_ms
+            )
+        self.started = {job_id: at for job_id, at in self.started.items() if job_id in ids}
+
+    def cell(self, status: dict) -> dict | None:
+        """`None` hides the module: an idle queue should not take bar space."""
+        now_ms = int(time.time() * 1000)
+        active = running(status)
+        pending = [job for job in live(status) if job.get("state") != "running"]
+        if active:
+            headline = max(active, key=lambda job: self.elapsed_ms(job, now_ms))
+            text = elide(headline.get("name", "?"), NAME_LIMIT)
+            if len(active) > 1:
+                text += f" +{len(active) - 1}"
+            text += f" \u00b7 {duration(self.elapsed_ms(headline, now_ms))}"
+            # A reading nothing is refreshing must not keep looking live: while
+            # the daemon is away the popup says so, and the popup is exactly the
+            # surface nobody is looking at.
+            return {"glyph": ICON, "text": text, "color": "green" if self.connected else "muted"}
+        if pending:
+            paused = bool(status.get("paused"))
+            word = "paused" if paused else "queued"
+            return {
+                "glyph": ICON,
+                "text": f"{len(pending)} {word}",
+                "color": "peach" if paused else "yellow",
+            }
+        return None
+
+    def popup(self, status: dict) -> list[dict]:
+        now_ms = int(time.time() * 1000)
+        items: list[dict] = []
+
+        jobs = live(status)
+        if not jobs:
+            items.append({"text": {"text": "queue empty", "color": "muted"}})
+        for job in jobs:
+            if job.get("state") == "running":
+                state = f"running \u00b7 {duration(self.elapsed_ms(job, now_ms))}"
+                color = "green"
+            else:
+                state = job.get("eligibility") or job.get("state", "?")
+                color = "muted"
+            cancelling = bool(job.get("cancelRequested"))
+            items.append(
+                {
+                    "row": {
+                        "lines": [
+                            {"text": f"#{job.get('id')} {job.get('name', '?')}"},
+                            {"text": state, "color": color, "small": True},
+                            {"text": short_command(job), "color": "faint", "small": True},
+                        ],
+                        "action": {
+                            "id": f"cancel:{job.get('id')}",
+                            "label": "cancelling" if cancelling else "cancel",
+                            "danger": True,
+                            "enabled": not cancelling,
+                        },
+                    }
+                }
+            )
+
+        limit = status.get("effectiveLimit")
+        leases = status.get("activeLeases", 0)
+        summary = f"{leases}/{limit} leases" if limit is not None else f"{leases} leases"
+        paused = bool(status.get("paused"))
+        # A unit item is a bare string; everything else is a single-key object.
+        items.append("divider")
+        items.append(
+            {
+                "row": {
+                    "lines": [{"text": summary, "color": "muted", "small": True}],
+                    "action": {
+                        "id": "unpause" if paused else "pause",
+                        "label": "unpause" if paused else "pause",
+                    },
+                }
+            }
+        )
+        if not self.connected:
+            items.append(
+                {"text": {"text": "reconnecting to mlqd\u2026", "color": "peach", "small": True}}
+            )
+        if self.error:
+            items.append({"text": {"text": self.error, "color": "red", "small": True}})
+        return items
+
+    def emit(self) -> None:
+        """Write the current frame, unless it would draw the same pixels."""
+        # The write stays under the lock: two threads that each build a frame
+        # and then race to write would put the older pixels on screen last.
+        with self.lock:
+            status = self.status
+            # Before the first snapshot there is nothing to say — not even that
+            # mlqd is missing, since an empty frame is how a module hides, and
+            # a bar with no queue daemon should look like a bar with no queue.
+            body = (
+                {"cell": None, "popup": []}
+                if status is None
+                else {"cell": self.cell(status), "popup": self.popup(status)}
+            )
+            frame = json.dumps(body, separators=(",", ":"))
+            if frame == self.last:
+                return
+            self.last = frame
+            try:
+                sys.stdout.write(frame + "\n")
+                sys.stdout.flush()
+            except BrokenPipeError:
+                # The bar is gone: nothing left to draw for.
+                os._exit(0)
+
+    # -- inputs ------------------------------------------------------------
+
+    def subscribe(self) -> None:
+        """mlqd's `subscribe`: one status snapshot per frame, forever."""
+        attempt = 0
+        while True:
+            started = time.monotonic()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.connect(socket_path())
+                    write_frame(
+                        sock,
+                        json.dumps(
+                            {
+                                "protocol_version": PROTOCOL_VERSION,
+                                "request_id": request_id(),
+                                "op": {"type": "subscribe"},
+                            }
+                        ).encode(),
+                    )
+                    while True:
+                        frame = read_frame(sock)
+                        if frame is None:
+                            break
+                        response = json.loads(frame)
+                        if response.get("error"):
+                            error = response["error"]
+                            raise ConnectionError(
+                                f"{error.get('code')}: {error.get('message')}"
+                            )
+                        reply = response.get("reply") or {}
+                        if reply.get("type") == "status":
+                            with self.lock:
+                                self.status = reply
+                                self.connected = True
+                                self.error = None
+                                self.note_starts(reply)
+                            self.emit()
+            except (OSError, ConnectionError, ValueError) as error:
+                print(f"mlqd subscription ended: {error}", file=sys.stderr)
+            with self.lock:
+                self.connected = False
+            self.emit()
+            if time.monotonic() - started >= STABLE_SESSION:
+                attempt = 0
+            time.sleep(RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)])
+            attempt += 1
+
+    def commands(self) -> None:
+        """The bar's half of the protocol, one JSON object per line."""
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError as error:
+                print(f"bad command from the bar: {error}", file=sys.stderr)
+                continue
+            if "popup" in message:
+                with self.lock:
+                    self.popup_open = bool(message["popup"])
+                # A popup that just opened wants seconds, not the frame from
+                # half a minute ago.
+                self.wake.set()
+            if "action" in message:
+                # Mutations go to a worker: an mlqd that is slow to answer must
+                # not stall the popup signal behind it.
+                self.actions.put(str(message["action"]))
+        # The bar closed our stdin: it is gone, and so is the reason to run.
+        os._exit(0)
+
+    def serve_actions(self) -> None:
+        """Run button presses off the stdin thread, one at a time."""
+        while True:
+            self.act(self.actions.get())
+
+    def act(self, action: str) -> None:
+        """Perform a button press, then let the next snapshot show the result."""
+        try:
+            if action == "pause":
+                request({"type": "pause"}, f"cosmicbar-mlq-pause-{request_id()}")
+            elif action == "unpause":
+                request({"type": "unpause"}, f"cosmicbar-mlq-unpause-{request_id()}")
+            elif action.startswith("cancel:"):
+                job = int(action.split(":", 1)[1])
+                request(
+                    {"type": "cancel", "job": job, "force": False},
+                    f"cosmicbar-mlq-cancel-{job}-{request_id()}",
+                )
+            else:
+                raise ValueError(f"unknown action `{action}`")
+            with self.lock:
+                self.error = None
+        except (OSError, ConnectionError, ValueError) as error:
+            # A failed mutation belongs on screen, not only in the journal.
+            with self.lock:
+                self.error = str(error)
+        self.emit()
+
+    def cadence(self) -> float | None:
+        """How long until what is on screen would read differently.
+
+        `None` when nothing is counting: a queue with no running job has no
+        clock to advance, and the next snapshot or popup wakes this up anyway.
+        """
+        with self.lock:
+            status = self.status
+            if status is None:
+                return None
+            active = running(status)
+            if not active:
+                return None
+            now_ms = int(time.time() * 1000)
+            # What is on screen: every live run while the popup is open, the
+            # cell's headline alone while it is shut.
+            shown = (
+                active
+                if self.popup_open
+                else [max(active, key=lambda job: self.elapsed_ms(job, now_ms))]
+            )
+            # `duration` prints seconds for the first minute and minutes after
+            # that, so wait exactly until the digit being shown turns over
+            # rather than redrawing a reading that cannot have changed.
+            waits = []
+            for job in shown:
+                elapsed = self.elapsed_ms(job, now_ms)
+                step = 1_000 if elapsed < 60_000 else 60_000
+                waits.append((step - elapsed % step) / 1000)
+            return max(min(waits), MIN_TICK)
+
+    def refresh(self) -> None:
+        """Advance the elapsed times nothing else would move."""
+        while True:
+            self.wake.wait(timeout=self.cadence())
+            # Cleared before the frame is built, so a signal that arrives while
+            # this one is being written costs another pass instead of being lost.
+            self.wake.clear()
+            self.emit()
+
+
+def main() -> None:
+    extension = Extension()
+    for target in (extension.commands, extension.serve_actions, extension.refresh):
+        threading.Thread(target=target, daemon=True).start()
+    extension.subscribe()
+
+
+if __name__ == "__main__":
+    main()

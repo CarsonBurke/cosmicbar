@@ -261,18 +261,21 @@ macro_rules! modules {
                     if !config.wants(ModuleId::Extension(index)) {
                         continue;
                     }
-                    if entry.command.is_empty() {
-                        log::warn!("extension `{}` has an empty command", entry.name);
-                        continue;
-                    }
                     // One name is one module, so a second entry under it is a
                     // typo rather than a second program. `Config::extension`
-                    // answers with the first declaration, so this must too.
+                    // answers with the first declaration, and this has to agree
+                    // even when that first declaration is the blank one — a
+                    // duplicate that took over would leave the running process
+                    // attached to a state the bar had already dropped.
                     if !placed.insert(index) {
                         log::warn!(
                             "extension `{}` is declared twice; ignoring the later entry",
                             entry.name
                         );
+                        continue;
+                    }
+                    if entry.command.is_empty() {
+                        log::warn!("extension `{}` has an empty command", entry.name);
                         continue;
                     }
                     let command: std::sync::Arc<[String]> = entry.command.as_slice().into();

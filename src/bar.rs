@@ -27,7 +27,7 @@ use crate::modules::{self, Ctx, ModuleId, Modules};
 
 /// Popup width bounds; the height follows the content.
 const POPUP_MIN_WIDTH: f32 = 280.0;
-const POPUP_MAX_WIDTH: f32 = 420.0;
+pub const POPUP_MAX_WIDTH: f32 = 420.0;
 const POPUP_MAX_HEIGHT: f32 = 720.0;
 
 static AUTOSIZE_ID: std::sync::LazyLock<cosmic::widget::Id> =

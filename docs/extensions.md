@@ -93,13 +93,15 @@ Colours are palette roles, never hex, so an extension follows the bar's theme:
 
 ## Rules that keep the bar cheap
 
-- Send a frame only when the pixels would change. The bar redraws on every
-  frame it receives.
+- Send a frame only when the pixels would change. A frame identical to the one
+  already on screen is dropped, so re-emitting whole state costs nothing but
+  your own work; anything else is a repaint.
 - Do not poll on a timer to see whether something changed; subscribe to the
   thing itself (a socket, a D-Bus signal, `inotify`). A timer is only for
   something that genuinely moves on its own, like an elapsed time — and then at
   the resolution you actually display.
-- Keep a frame small. Anything over 256 KiB is dropped as a runaway writer.
+- Keep a frame under 256 KiB, newline included. A longer line is a runaway
+  writer, not a bar cell: the bar stops reading and restarts the program.
 - A malformed frame is logged and ignored; the last good frame stays on screen.
 
 ## Minimal example

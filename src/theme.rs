@@ -445,6 +445,12 @@ pub fn label<'a, Message: 'a>(
 /// included, which is what makes a character count a usable width.
 const MONO_ADVANCE: f32 = 0.6;
 
+/// Width of `text` at `size`, in logical pixels. Exact rather than a guess: the
+/// bar's font is the mono variant, so every character is the same cell wide.
+pub fn text_width(text: &str, size: f32) -> f32 {
+    text.chars().count() as f32 * MONO_ADVANCE * size
+}
+
 /// A bar label whose text keeps a fixed field, so the island does not resize as
 /// the digits change and shove the centre of the bar around — waybar's
 /// `min-length`, without its cost: padding the *string* to that width would put

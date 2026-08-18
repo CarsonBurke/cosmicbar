@@ -35,11 +35,17 @@ pub enum Event {
 pub const ISLAND: crate::theme::Island = crate::theme::Island::Flat;
 /// Estimating how tall a frame wants to be: iced's default relative line
 /// height, the `Column` spacing between items, the tighter spacing between the
-/// lines inside a row, and a divider with its own line.
+/// lines inside a row, the gap before a row's button, and a divider's own line.
 const LINE_HEIGHT: f32 = 1.4;
 const ITEM_SPACING: f32 = 6.0;
 const LINE_SPACING: f32 = 1.0;
+const ROW_SPACING: f32 = 8.0;
 const DIVIDER_ROW: f32 = 1.0;
+/// This popup's own padding, and the width a scrollbar takes off the text.
+const PADDING: f32 = 12.0;
+const SCROLLBAR: f32 = 10.0;
+/// libcosmic draws button labels at its own fixed size, not the bar's.
+const BUTTON_TEXT: f32 = 14.0;
 /// Where an extension's list starts scrolling instead of growing.
 const LIST_HEIGHT: f32 = 420.0;
 
@@ -149,19 +155,23 @@ impl State {
         if frame.popup.is_empty() {
             return None;
         }
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
+        let mut body = widget::Column::new()
+            .spacing(ITEM_SPACING)
+            .width(Length::Fill);
         for item in &frame.popup {
             body = body.push(match item {
                 Item::Divider => widget::divider::horizontal::default().into(),
                 Item::Text(line) => self.line(line, ctx),
                 Item::Row(row) => {
-                    let mut lines = widget::Column::new().spacing(1).width(Length::Fill);
+                    let mut lines = widget::Column::new()
+                        .spacing(LINE_SPACING)
+                        .width(Length::Fill);
                     for line in &row.lines {
                         lines = lines.push(self.line(line, ctx));
                     }
                     let mut content = widget::Row::new()
                         .push(lines)
-                        .spacing(8)
+                        .spacing(ROW_SPACING)
                         .align_y(Alignment::Center);
                     if let Some(action) = &row.action {
                         let class = if action.danger {
@@ -186,26 +196,48 @@ impl State {
         }
         // How long the list is belongs to the extension, and a popup taller than
         // the bar's own limit is never mapped at all, so scroll it. The height is
-        // measured from the text the items actually carry, so a three-row popup
-        // neither opens a half-empty panel nor grows a scrollbar it does not need.
-        let line = |line: &Line| {
-            LINE_HEIGHT
-                * match line.small {
+        // measured from the text the items actually carry - in the mono font a
+        // character count is a width, so a line that wraps is counted as the
+        // rows it really draws - and a popup that fits neither opens a
+        // half-empty panel nor grows a scrollbar it does not need.
+        let spacing = cosmic::theme::spacing();
+        // The widest the popup can be, less this container's padding and the
+        // room a scrollbar takes out of the text.
+        let width = crate::bar::POPUP_MAX_WIDTH - 2.0 * PADDING - SCROLLBAR;
+        let line = |avail: f32| {
+            move |line: &Line| {
+                let size = match line.small {
                     true => ctx.small(),
                     false => ctx.font_size,
-                }
+                };
+                let wraps = (crate::theme::text_width(&line.text, size) / avail.max(1.0))
+                    .ceil()
+                    .max(1.0);
+                wraps * size * LINE_HEIGHT
+            }
         };
         let rows: f32 = frame
             .popup
             .iter()
             .map(|item| match item {
                 Item::Divider => DIVIDER_ROW,
-                Item::Text(text) => line(text),
+                Item::Text(text) => line(width)(text),
                 Item::Row(row) => {
-                    let lines: f32 = row.lines.iter().map(&line).sum();
-                    // A row is at least as tall as its button.
-                    lines.max(ctx.font_size * LINE_HEIGHT)
-                        + LINE_SPACING * row.lines.len().saturating_sub(1) as f32
+                    // A button steals width from the lines beside it, and
+                    // libcosmic fixes its height at the theme's large spacing
+                    // step whatever the font size, so a one-line row with a
+                    // button is as tall as the button.
+                    let button = row.action.as_ref().map(|action| {
+                        crate::theme::text_width(&action.label, BUTTON_TEXT)
+                            + 2.0 * spacing.space_s as f32
+                    });
+                    let avail = width - button.map_or(0.0, |width| width + ROW_SPACING);
+                    let lines: f32 = row.lines.iter().map(line(avail)).sum();
+                    let floor = match button {
+                        Some(_) => spacing.space_l as f32,
+                        None => ctx.font_size * LINE_HEIGHT,
+                    };
+                    lines.max(floor) + LINE_SPACING * row.lines.len().saturating_sub(1) as f32
                 }
             })
             .sum::<f32>()
@@ -214,7 +246,7 @@ impl State {
             widget::scrollable(body)
                 .height(Length::Fixed(rows.min(LIST_HEIGHT)))
                 .apply(widget::container)
-                .padding(12)
+                .padding(PADDING)
                 .into(),
         )
     }

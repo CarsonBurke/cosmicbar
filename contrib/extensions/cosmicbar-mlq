@@ -42,8 +42,10 @@ RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
 STABLE_SESSION = 60.0
 # nf-md-graph-outline: a queue of learning runs.
 ICON = "\U000f1049"
-# Longest job name drawn in the bar before elision.
+# Longest job name drawn in the bar before elision, and longest command drawn in
+# a popup row: two popup lines' worth at the width the bar gives a row.
 NAME_LIMIT = 26
+COMMAND_LIMIT = 72
 # Elapsed times only move forwards, so a redraw with nothing else to say is
 # worth it exactly when the digit on screen turns over - see `cadence`. This is
 # only the floor on that wait, so a clock landing on a boundary cannot spin.
@@ -129,8 +131,13 @@ def duration(ms: int) -> str:
 
 
 def short_command(job: dict) -> str:
-    """Last path-looking parts of the argv, which is what identifies a run."""
-    return " ".join(arg.rsplit("/", 1)[-1] for arg in job.get("args", []))
+    """Last path-looking parts of the argv, which is what identifies a run.
+
+    Elided: a training command is a screenful of flags, and a popup row that
+    wraps six times buries the rows under it. The job's name is the identity;
+    this is the reminder of what it runs.
+    """
+    return elide(" ".join(arg.rsplit("/", 1)[-1] for arg in job.get("args", [])), COMMAND_LIMIT)
 
 
 def live(status: dict) -> list[dict]:
@@ -333,11 +340,18 @@ class Extension:
                                 self.error = None
                                 self.note_starts(reply)
                             self.emit()
+                            # A snapshot can be the first thing on screen with a
+                            # clock in it, and `refresh` may be parked on a
+                            # cadence taken while the queue was still idle.
+                            self.wake.set()
             except (OSError, ConnectionError, ValueError) as error:
                 print(f"mlqd subscription ended: {error}", file=sys.stderr)
             with self.lock:
                 self.connected = False
             self.emit()
+            # The cell just changed colour, and the elapsed times it carries are
+            # local extrapolation from here on: nothing else will wake `refresh`.
+            self.wake.set()
             if time.monotonic() - started >= STABLE_SESSION:
                 attempt = 0
             time.sleep(RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)])

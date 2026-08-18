@@ -312,7 +312,7 @@ impl State {
                 .snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.primary.as_ref())
-                .map(|active| active.device.iface.clone())
+                .map(|active| Arc::<str>::from(active.device.iface.as_str()))
                 .filter(|iface| !iface.is_empty())
             {
                 subscriptions.push(Subscription::run_with(iface, rate_stream));
@@ -322,7 +322,7 @@ impl State {
                 .as_ref()
                 .and_then(|snapshot| snapshot.wifi.as_ref())
                 .filter(|_| self.snapshot.as_ref().is_some_and(|s| s.wireless_enabled))
-                .map(|wifi| wifi.path.clone())
+                .map(|wifi| Arc::<str>::from(wifi.path.as_str()))
             {
                 subscriptions.push(Subscription::run_with(device, scan_stream));
             }
@@ -810,8 +810,8 @@ fn wifi_icon(strength: u8) -> &'static str {
 fn band(mhz: u32) -> &'static str {
     match mhz {
         0 => "?",
-        ..3000 => "2.4 GHz",
-        ..5925 => "5 GHz",
+        1..3000 => "2.4 GHz",
+        3000..5925 => "5 GHz",
         _ => "6 GHz",
     }
 }
@@ -1188,8 +1188,8 @@ type Boxed = std::pin::Pin<Box<dyn Stream<Item = Message> + Send>>;
 
 /// Byte counters are the one source with no push interface, so they are
 /// polled — once a second, and only while the popup is on screen.
-fn rate_stream(iface: &String) -> Boxed {
-    let iface = iface.clone();
+fn rate_stream(iface: &Arc<str>) -> Boxed {
+    let iface = Arc::clone(iface);
     Box::pin(cosmic::iced::stream::channel(4, async move |mut sender| {
         let mut previous: Option<(Instant, u64, u64)> = None;
         loop {
@@ -1225,8 +1225,8 @@ fn counters(iface: &str) -> Option<(u64, u64)> {
 }
 
 /// Opening the popup asks for a fresh scan; the results arrive as signals.
-fn scan_stream(device: &String) -> Boxed {
-    let device = device.clone();
+fn scan_stream(device: &Arc<str>) -> Boxed {
+    let device = Arc::clone(device);
     Box::pin(cosmic::iced::stream::channel(1, async move |mut sender| {
         loop {
             if let Err(error) = request_scan(&device).await {
@@ -1331,15 +1331,14 @@ async fn read_snapshot(bus: &Bus, detailed: bool) -> Snapshot {
     }
     // A connection that is still coming up is not primary yet, but the bar
     // should say "connecting" with its name rather than "offline".
-    if snapshot.primary.is_none() {
-        if let Some(index) = snapshot.secondary.iter().position(|active| {
+    if snapshot.primary.is_none()
+        && let Some(index) = snapshot.secondary.iter().position(|active| {
             active.state == ACTIVE_ACTIVATING
                 && (active.kind.starts_with("802-11-wireless")
                     || active.kind.starts_with("802-3-ethernet"))
         }) {
             snapshot.primary = Some(snapshot.secondary.remove(index));
         }
-    }
 
     if detailed {
         snapshot.profiles = read_profiles(bus, &snapshot).await;

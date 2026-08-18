@@ -510,9 +510,9 @@ pub fn glyph_only<'a>(
     glyph: impl Into<std::borrow::Cow<'a, str>> + 'a,
     size: f32,
 ) -> cosmic::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    text(glyph)
-        .size(size * GLYPH_ONLY_SCALE)
-        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-            cosmic::iced::Pixels(size * GLYPH_ONLY_SCALE),
-        ))
+    text(glyph).size(size * GLYPH_ONLY_SCALE).line_height(
+        cosmic::iced::widget::text::LineHeight::Absolute(cosmic::iced::Pixels(
+            size * GLYPH_ONLY_SCALE,
+        )),
+    )
 }

@@ -713,12 +713,11 @@ async fn session(events: &mut Events) -> zbus::Result<()> {
                         resync(&connection, player).await;
                     }
                     changed = true;
-                } else if interface == ROOT_IFACE {
-                    if let Some(identity) = updates.get("Identity").and_then(text) {
+                } else if interface == ROOT_IFACE
+                    && let Some(identity) = updates.get("Identity").and_then(text) {
                         player.identity = identity;
                         changed = true;
                     }
-                }
             }
             Wire::Seeked(message) => {
                 let Some(bus) = sender_of(&message, &owners) else {

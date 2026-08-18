@@ -847,11 +847,10 @@ fn apply(message: &BusMessage, snapshot: &mut Snapshot) -> Change {
                         });
                     }
                     IF_BATTERY => {
-                        if let Some(device) = snapshot.device_mut(path) {
-                            if device.battery.take().is_some() {
+                        if let Some(device) = snapshot.device_mut(path)
+                            && device.battery.take().is_some() {
                                 change = change.max(device_change(device.connected));
                             }
-                        }
                     }
                     IF_ADAPTER => {
                         if snapshot

@@ -31,7 +31,6 @@ pub fn guard<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Messag
     })
 }
 
-
 struct Guard<'a> {
     content: Element<'a, Message>,
 }
@@ -125,9 +124,7 @@ impl Widget<Message, Theme, Renderer> for Guard<'_> {
         // cursor shape this surface wants.
         let seen = match event {
             IcedEvent::Mouse(mouse::Event::CursorLeft) => Some(Seen::Gone),
-            IcedEvent::Mouse(mouse::Event::CursorMoved { position }) => {
-                Some(Seen::At(*position))
-            }
+            IcedEvent::Mouse(mouse::Event::CursorMoved { position }) => Some(Seen::At(*position)),
             _ => None,
         };
         if let Some(seen) = seen {

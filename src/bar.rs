@@ -73,7 +73,14 @@ impl Message {
             Self::Sized(_, width) => format!("Sized({width})"),
             Self::Rect(RectangleUpdate::Init(_)) => "Rect(Init)".into(),
             Self::Rect(RectangleUpdate::Rectangle(((_, id), rect))) => {
-                format!("Rect({} @ {},{} {}x{})", id.name(), rect.x, rect.y, rect.width, rect.height)
+                format!(
+                    "Rect({} @ {},{} {}x{})",
+                    id.name(),
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height
+                )
             }
             Self::Toggle(_, id) => format!("Toggle({})", id.name()),
             Self::ClosePopup => "ClosePopup".into(),
@@ -270,10 +277,10 @@ impl cosmic::Application for Bar {
     }
 
     fn view_window(&self, id: SurfaceId) -> Element<'_, Message> {
-        if let Some(popup) = &self.popup {
-            if popup.id == id {
-                return self.view_popup(popup);
-            }
+        if let Some(popup) = &self.popup
+            && popup.id == id
+        {
+            return self.view_popup(popup);
         }
         if self.bars.iter().any(|bar| bar.surface == id) {
             return self.view_bar(id);
@@ -367,16 +374,16 @@ impl Bar {
             return Task::none();
         };
         let removed = self.bars.remove(index);
-        self.rects.retain(|(surface, _), _| *surface != removed.surface);
+        self.rects
+            .retain(|(surface, _), _| *surface != removed.surface);
         let mut tasks = vec![destroy_layer_surface(removed.surface)];
         if self
             .popup
             .as_ref()
             .is_some_and(|popup| popup.parent == removed.surface)
+            && let Some(popup) = self.popup.take()
         {
-            if let Some(popup) = self.popup.take() {
-                tasks.push(destroy_popup(popup.id));
-            }
+            tasks.push(destroy_popup(popup.id));
         }
         Task::batch(tasks)
     }
@@ -446,11 +453,7 @@ impl Bar {
                 height: self.config.height as f32,
             });
         let id = SurfaceId::unique();
-        self.popup = Some(Popup {
-            id,
-            parent,
-            module,
-        });
+        self.popup = Some(Popup { id, parent, module });
         log::debug!(
             "opening popup {id:?} for {} on {parent:?}, anchor {anchor:?}, grab={grab}",
             module.name()
@@ -591,7 +594,12 @@ impl Bar {
             let joins = island == crate::theme::Island::Join
                 && group_island == Some(crate::theme::Island::Start);
             if !joins && !group.is_empty() {
-                row = row.push(self.island_group(surface, group_island, std::mem::take(&mut group), ctx));
+                row = row.push(self.island_group(
+                    surface,
+                    group_island,
+                    std::mem::take(&mut group),
+                    ctx,
+                ));
             }
             if !joins {
                 group_island = Some(island.opened());

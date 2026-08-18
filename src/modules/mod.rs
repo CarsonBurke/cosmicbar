@@ -395,9 +395,7 @@ pub fn right_click(id: ModuleId) -> Option<Message> {
         // waybar: `bluetoothctl power off`, made reversible.
         ModuleId::Bluetooth => ModuleEvent::Bluetooth(bluetooth::Event::TogglePowered),
         // waybar: `mako.sh dismiss`.
-        ModuleId::Notifications => {
-            ModuleEvent::Notifications(notifications::Event::DismissAll)
-        }
+        ModuleId::Notifications => ModuleEvent::Notifications(notifications::Event::DismissAll),
         // waybar: `pkill -RTMIN+1 waybar`, which is how its update module was
         // told to re-check.
         ModuleId::Updates => ModuleEvent::Updates(updates::Event::CheckNow),

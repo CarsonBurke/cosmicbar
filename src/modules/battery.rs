@@ -659,8 +659,8 @@ fn stale(updated: i64, now_ms: i64) -> Option<String> {
         return None;
     }
     Some(match age {
-        ..3600 => format!("{} min", age / 60),
-        ..86400 => format!("{} hr", age / 3600),
+        STALE_AFTER..3600 => format!("{} min", age / 60),
+        3600..86400 => format!("{} hr", age / 3600),
         _ => format!("{} d", age / 86400),
     })
 }

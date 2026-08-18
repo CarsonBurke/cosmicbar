@@ -67,7 +67,9 @@ pub fn subscription() -> Subscription<Message> {
         cosmic::iced::stream::channel(4, async move |mut sender| {
             let path = socket_path();
             // A socket left behind by a crashed bar would block binding.
-            if std::fs::metadata(&path).is_ok() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+            if std::fs::metadata(&path).is_ok()
+                && std::os::unix::net::UnixStream::connect(&path).is_err()
+            {
                 let _ = std::fs::remove_file(&path);
             }
             let listener = match tokio::net::UnixListener::bind(&path) {
@@ -82,7 +84,9 @@ pub fn subscription() -> Subscription<Message> {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let Ok(stream) = stream.into_std() else { continue };
+                let Ok(stream) = stream.into_std() else {
+                    continue;
+                };
                 let mut line = String::new();
                 if BufReader::new(stream).read_line(&mut line).is_err() {
                     continue;

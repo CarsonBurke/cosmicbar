@@ -7,10 +7,10 @@
 //! forwards everything to its content and claims only the events it was given,
 //! and only when the content has not already claimed them.
 
+use cosmic::Element;
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
 use cosmic::iced::{Event as IcedEvent, Length, Rectangle, Size, Vector};
-use cosmic::Element;
 
 use crate::bar::Message;
 
@@ -150,9 +150,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pointer<'_> {
         viewport: &Rectangle,
         renderer: &cosmic::Renderer,
     ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn draw(

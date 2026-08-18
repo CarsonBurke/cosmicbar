@@ -640,7 +640,7 @@ impl Sampler {
             .filter_map(|(pid, ticks)| {
                 let before = self.prev_procs.get(pid)?;
                 let delta = ticks.saturating_sub(*before);
-                (delta > 0).then(|| (*pid, delta as f32 * scale))
+                (delta > 0).then_some((*pid, delta as f32 * scale))
             })
             .collect();
         self.prev_procs = now;

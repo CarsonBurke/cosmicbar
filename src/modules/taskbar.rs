@@ -600,14 +600,13 @@ fn entry_icon(path: &Path) -> Option<String> {
                 return None;
             }
             in_entry = line == "[Desktop Entry]";
-        } else if in_entry {
-            if let Some(icon) = line.strip_prefix("Icon=") {
+        } else if in_entry
+            && let Some(icon) = line.strip_prefix("Icon=") {
                 let icon = icon.trim();
                 if !icon.is_empty() {
                     return Some(icon.to_string());
                 }
             }
-        }
     }
     None
 }
@@ -629,11 +628,10 @@ fn scan_for_wm_class(dir: &Path, app_id: &str) -> Option<String> {
             .map(str::trim)
             .filter_map(|line| line.strip_prefix("StartupWMClass="))
             .any(|class| class.trim().eq_ignore_ascii_case(app_id));
-        if claims {
-            if let Some(icon) = entry_icon(&path) {
+        if claims
+            && let Some(icon) = entry_icon(&path) {
                 return Some(icon);
             }
-        }
     }
     None
 }

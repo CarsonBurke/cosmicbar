@@ -380,7 +380,7 @@ fn dot<'a>(style: Style, palette: Palette, ctx: &Ctx) -> Element<'a, Message> {
         .class(cosmic::theme::Container::custom(move |_theme| {
             cosmic::widget::container::Style {
                 text_color: None,
-                background: filled.then(|| Background::Color(color)),
+                background: filled.then_some(Background::Color(color)),
                 border: Border {
                     // Half the box is a circle for any renderer that clamps the
                     // radius, which is every one of them.

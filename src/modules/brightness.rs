@@ -320,8 +320,8 @@ impl State {
     /// connector is known, otherwise every display at once (which is what the
     /// waybar script's averaged readout and paired `up 1 5 && up 2 5` did).
     fn target(&self, ctx: &Ctx) -> Target {
-        if let Some(output) = &ctx.output {
-            if let Some(index) = self.displays.iter().position(|display| {
+        if let Some(output) = &ctx.output
+            && let Some(index) = self.displays.iter().position(|display| {
                 display
                     .found
                     .connector
@@ -330,7 +330,6 @@ impl State {
             }) {
                 return Target::One(index);
             }
-        }
         if self.displays.len() == 1 {
             Target::One(0)
         } else {

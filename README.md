@@ -5,11 +5,13 @@ harness: Rust and [libcosmic](https://github.com/pop-os/libcosmic) on
 `wlr-layer-shell`. Every module reads its own source in-process, and a cell
 opens a popup you can click instead of a tooltip you cannot.
 
-![bar](docs/bar.png)
+<img width="3834" height="36" alt="image" src="https://github.com/user-attachments/assets/a45b7d63-c54d-47ca-96d4-824a039415a0" />
 
 | a module's popup | an extension's popup |
 | --- | --- |
 | ![gpu](docs/gpu.png) | ![queue](docs/popup.png) |
+
+![gpu](docs/bar.png)
 
 ## Why
 

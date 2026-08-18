@@ -3,11 +3,36 @@
 //! A malformed or missing config never prevents the bar from coming up; the
 //! defaults below are the shipped layout.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use cosmic::iced::futures::{SinkExt, StreamExt};
+use inotify::{EventOwned, EventStream, Inotify, WatchMask};
 use serde::Deserialize;
 
 use crate::modules::ModuleId;
+
+/// What a save looks like, however the editor performs it: `CLOSE_WRITE` for a
+/// write in place, `MOVED_TO` for the write-a-temporary-and-rename every careful
+/// editor does, and the two removals so deleting the config falls back to the
+/// shipped defaults. `MODIFY` is deliberately absent: it fires while the writer
+/// is still going, and half a TOML file is a parse error, not a config.
+const FILE_EVENTS: WatchMask = WatchMask::CLOSE_WRITE
+    .union(WatchMask::MOVED_TO)
+    .union(WatchMask::MOVED_FROM)
+    .union(WatchMask::DELETE);
+/// The config's own directory coming or going. Removing it takes the config with
+/// it, which is a fall back to the defaults, and the same event re-arms the
+/// directory watch when it returns.
+const DIR_EVENTS: WatchMask = WatchMask::CREATE
+    .union(WatchMask::MOVED_TO)
+    .union(WatchMask::MOVED_FROM)
+    .union(WatchMask::DELETE);
+/// One save is a burst of events; this collapses it into a single reload.
+const COALESCE: Duration = Duration::from_millis(150);
+/// Interval for the fallback watcher, and the fallback watcher only.
+const POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -147,42 +172,164 @@ impl Config {
     }
 
     /// Modification time of the config file, if it exists.
-    pub(crate) fn stamp() -> Option<std::time::SystemTime> {
+    fn stamp() -> Option<std::time::SystemTime> {
         std::fs::metadata(Self::path())
             .ok()
             .and_then(|meta| meta.modified().ok())
     }
 
+    /// The directory the config file lives in.
+    fn dir() -> PathBuf {
+        Self::path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Reload the layout when the config file changes, so editing it does not
-    /// mean restarting the bar. This is one `stat` every two seconds: watching
-    /// the file properly would mean an inotify dependency and re-arming the
-    /// watch on every editor rename-in-place, which costs more than the stat.
+    /// mean restarting the bar. The kernel reports the write; nothing here runs
+    /// on an interval unless inotify itself is unavailable.
     pub fn watch() -> cosmic::iced::Subscription<crate::bar::Message> {
         cosmic::iced::Subscription::run(|| {
             cosmic::iced::stream::channel(1, async move |mut sender| {
-                use cosmic::iced::futures::SinkExt;
-
-                let mut seen = Self::stamp();
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let stamp = Self::stamp();
-                    if stamp == seen {
-                        continue;
-                    }
-                    seen = stamp;
-                    log::info!("{} changed; reloading", Self::path().display());
-                    if sender
-                        .send(crate::bar::Message::Control(
-                            crate::control::Command::Reload,
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                match Self::inotify() {
+                    Ok(events) => Self::on_events(events, &mut sender).await,
+                    // inotify instances and watches are per-user limits that
+                    // another program can exhaust. A bar that stops noticing
+                    // config edits is worse than a `stat` every two seconds.
+                    Err(error) => {
+                        log::warn!(
+                            "watching {}: {error}; polling instead",
+                            Self::path().display()
+                        );
+                        Self::on_stamp(&mut sender).await;
                     }
                 }
             })
         })
+    }
+
+    /// inotify for the config file, watching its *directory*: an editor saves by
+    /// writing a temporary file and renaming it over the target, so the inode a
+    /// watch on the file would hold is not the inode that ends up on disk. A
+    /// directory watch survives that, and reports a config written for the first
+    /// time. `~/.config` is watched as well, for the one thing the directory
+    /// watch cannot report: that directory itself appearing.
+    fn inotify() -> std::io::Result<EventStream<[u8; 1024]>> {
+        let dir = Self::dir();
+        let inotify = Inotify::init()?;
+        let mut watches = inotify.watches();
+        let watched = watches.add(&dir, FILE_EVENTS);
+        let parent = match dir.parent() {
+            Some(parent) => watches.add(parent, DIR_EVENTS).is_ok(),
+            None => false,
+        };
+        // A config directory that does not exist yet is not a failure: the
+        // parent watch reports it appearing and the watch is added then. Neither
+        // directory existing is, because there is nothing to hang a watch on.
+        if let Err(error) = watched
+            && !parent
+        {
+            return Err(error);
+        }
+        inotify.into_event_stream([0; 1024])
+    }
+
+    /// One reload per save, whatever burst of events the editor produced.
+    async fn on_events(
+        mut events: EventStream<[u8; 1024]>,
+        sender: &mut cosmic::iced::futures::channel::mpsc::Sender<crate::bar::Message>,
+    ) {
+        let dir = Self::dir();
+        let name = dir.file_name().map(OsStr::to_owned);
+        // `path` is two components joined onto a base, so it always has a file
+        // name; without one there is no file to watch for.
+        let Some(file) = Self::path().file_name().map(OsStr::to_owned) else {
+            return;
+        };
+        loop {
+            // Wait for the config file, ignoring the rest of the directory.
+            loop {
+                match events.next().await {
+                    Some(Ok(event)) => {
+                        let directory = Self::rearm(&event, &dir, name.as_deref(), &events);
+                        if directory || event.name.as_deref() == Some(file.as_os_str()) {
+                            break;
+                        }
+                    }
+                    // A read error, or the instance closing: no watch, and so no
+                    // reloads. The bar keeps the config it has.
+                    Some(Err(error)) => {
+                        log::warn!("watching {}: {error}", dir.display());
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            // A save is several events - the temporary file, the rename over the
+            // target, an editor's backup - and each one would cost a relayout.
+            while let Ok(Some(Ok(event))) = tokio::time::timeout(COALESCE, events.next()).await {
+                Self::rearm(&event, &dir, name.as_deref(), &events);
+            }
+            log::info!("{} changed; reloading", Self::path().display());
+            if sender
+                .send(crate::bar::Message::Control(
+                    crate::control::Command::Reload,
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Re-arm the directory watch when the config directory itself appears, and
+    /// say whether the event was about it.
+    ///
+    /// A directory that is created, or replaced by a rename, is a different inode
+    /// from the one the previous watch held, and inotify drops a watch with its
+    /// inode. `add` is keyed by inode, so re-adding a watch that is still live
+    /// costs a syscall and changes nothing. What moved in may contain a config,
+    /// which is why this is also a reason to reload.
+    fn rearm(
+        event: &EventOwned,
+        dir: &std::path::Path,
+        name: Option<&OsStr>,
+        events: &EventStream<[u8; 1024]>,
+    ) -> bool {
+        if name.is_none() || event.name.as_deref() != name {
+            return false;
+        }
+        if let Err(error) = events.watches().add(dir, FILE_EVENTS) {
+            log::debug!("watching {}: {error}", dir.display());
+        }
+        true
+    }
+
+    /// The fallback when inotify is unavailable: one `stat` every two seconds.
+    async fn on_stamp(
+        sender: &mut cosmic::iced::futures::channel::mpsc::Sender<crate::bar::Message>,
+    ) {
+        let mut seen = Self::stamp();
+        loop {
+            tokio::time::sleep(POLL).await;
+            let stamp = Self::stamp();
+            if stamp == seen {
+                continue;
+            }
+            seen = stamp;
+            log::info!("{} changed; reloading", Self::path().display());
+            if sender
+                .send(crate::bar::Message::Control(
+                    crate::control::Command::Reload,
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 
     pub fn palette(&self) -> crate::theme::Palette {

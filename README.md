@@ -21,17 +21,17 @@ fork every five seconds, tooltips where an interface belongs, and layout tricks
 for anything that is not a label.
 
 - **Push, not poll.** D-Bus, niri's IPC, logind, BlueZ, UPower, NetworkManager,
-  MPRIS and the tray all deliver events, so no module sits on an interval and no
-  `exec` script runs on a timer. The bar's own clock is a minute-aligned tick for
-  the cells that show wall-clock time, and it only goes to one second while a
-  playing MPRIS popup or an armed power confirmation is on screen. What the
-  kernel exposes no event for is sampled in-process instead - `/proc` for CPU and
-  memory, NVML for the GPU, every 2s, no fork per reading - and detail nobody is
-  looking at (per-process CPU share, per-process VRAM, DDC values) is only
-  gathered while its popup is open. Three things run a program because there is
-  no library to call: `ddcutil` for external monitors, whose `detect` retries
-  once a minute until one answers, and `checkupdates` plus your AUR helper's
-  `-Qua` every 30 minutes.
+  MPRIS, the tray and inotify for the config file all deliver events, so no
+  module sits on an interval and no `exec` script runs on a timer. The bar's own
+  clock is a minute-aligned tick for the cells that show wall-clock time, and it
+  only goes to one second while a playing MPRIS popup or an armed power
+  confirmation is on screen. What the kernel exposes no event for is sampled
+  in-process instead - `/proc` for CPU and memory, NVML for the GPU, every 2s, no
+  fork per reading - and detail nobody is looking at (per-process CPU share,
+  per-process VRAM, DDC values) is only gathered while its popup is open. Three
+  things run a program because there is no library to call: `ddcutil` for
+  external monitors, whose `detect` retries once a minute until one answers, and
+  `checkupdates` plus your AUR helper's `-Qua` every 30 minutes.
 - **Real widgets.** A cell opens a popup surface with working controls: pick a
   wifi network, connect a headset, switch audio sink, kill a process, jump to a
   window, cancel a queued job. Keybinds can open them without the pointer, and

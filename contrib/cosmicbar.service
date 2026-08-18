@@ -1,0 +1,19 @@
+[Unit]
+Description=cosmicbar status bar
+Documentation=https://github.com/CarsonBurke/cosmicbar
+# The bar is a Wayland client: it must not be started before a session exists.
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/cosmicbar
+# Config changes are picked up live; this is for anything else.
+ExecReload=%h/.cargo/bin/cosmicbar reload
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

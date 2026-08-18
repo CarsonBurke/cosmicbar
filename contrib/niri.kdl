@@ -1,0 +1,20 @@
+// niri integration for cosmicbar. Paste into ~/.config/niri/config.kdl.
+//
+// The bar is a plain wlr-layer-shell client: it needs no helper daemons. In
+// particular it hosts the StatusNotifierItem watcher itself, so a `kded6`
+// launched only to provide `org.kde.StatusNotifierWatcher` for waybar can go.
+
+// niri spawns through the session's PATH; use the absolute path
+// ("/home/you/.cargo/bin/cosmicbar") if ~/.cargo/bin is not in it.
+spawn-at-startup "cosmicbar"
+
+// Popups can be opened from a keybind, which waybar could not do at all
+// (`pkill -SIGRTMIN+N` only refreshed a module). One socket per Wayland
+// display, so this works unchanged in a nested session.
+binds {
+    Mod+Shift+C { spawn "cosmicbar" "toggle" "extension:mlq"; }
+    Mod+Shift+D { spawn "cosmicbar" "toggle" "date"; }
+    Mod+Shift+P { spawn "cosmicbar" "toggle" "power"; }
+    Mod+Shift+N { spawn "cosmicbar" "toggle" "notifications"; }
+    Mod+Shift+Escape { spawn "cosmicbar" "close"; }
+}

@@ -1,0 +1,48 @@
+[package]
+name = "cosmicbar"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "A libcosmic layer-shell status bar for niri: push-driven modules, real widgets, clickable popups"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+jiff = "0.2"
+env_logger = "0.11"
+futures = "0.3"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+
+# Module data sources. Every module reads its source directly instead of
+# shelling out: /proc and /sys for cpu/memory/thermals, NVML, niri's IPC socket, D-Bus
+# (zbus: NetworkManager, BlueZ, UPower, logind, MPRIS, mako), PulseAudio, and
+# the StatusNotifierItem tray protocol.
+nvml-wrapper = "0.12"
+niri-ipc = "26.4"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+libpulse-binding = "2.30"
+# `data` (default) gives the item/menu model over zbus; the gtk feature would
+# drag GTK3 in for its menu widget, which we render ourselves.
+system-tray = "0.8"
+# Tray items and app windows name their icons the freedesktop way; this is the
+# resolver libcosmic itself uses, so a bar icon and a COSMIC icon agree.
+freedesktop-icons = { git = "https://github.com/pop-os/freedesktop-icons", package = "cosmic-freedesktop-icons", version = "0.4.0" }
+
+# Pinned: libcosmic is git-only. This rev is master as of 2026-08-10 and is the
+# same generation as the installed COSMIC 1.5 packages, so its wlr-layer-shell
+# path is exercised by cosmic-osd/cosmic-launcher on this machine.
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+rev = "1f8d8786940cc6db59d412153c5a03f69a20375c"
+default-features = false
+features = ["autosize", "multi-window", "tokio", "wayland", "winit"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

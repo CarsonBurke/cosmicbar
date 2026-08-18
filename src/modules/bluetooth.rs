@@ -61,8 +61,6 @@ const ICON_DISPLAY: &str = "\u{f0379}";
 const ICON_PRINTER: &str = "\u{f042a}";
 const ICON_WATCH: &str = "\u{f0589}";
 
-/// Longest device name rendered in the bar.
-const NAME_LIMIT: usize = 18;
 /// Longest device name rendered in a popup row: a name that wraps costs a
 /// whole extra line in a popup that has to fit the screen.
 const ROW_LIMIT: usize = 18;
@@ -254,16 +252,20 @@ impl State {
             );
         }
 
-        let connected: Vec<&Device> = snapshot.connected().collect();
-        // Scanning is the popup's business: the bar keeps saying what is
-        // connected while a scan runs behind it, rather than growing a glyph.
-        let (glyph, rest) = match connected.len() {
+        let connected = snapshot.connected().count();
+        // Which device it is belongs to the popup: a headset's name is longer
+        // than everything else on the bar put together, and it moves the clock
+        // every time it connects. The glyph already says something is connected,
+        // so a count is only worth its space past the first one. Scanning is the
+        // popup's business too - the cell keeps saying what is connected while a
+        // scan runs behind it.
+        let (glyph, rest) = match connected {
             0 => (ICON_ON, String::new()),
-            1 => (ICON_CONNECTED, elide(&connected[0].name, NAME_LIMIT)),
+            1 => (ICON_CONNECTED, String::new()),
             count => (ICON_CONNECTED, count.to_string()),
         };
 
-        let class = cosmic::theme::Text::Color(if connected.is_empty() {
+        let class = cosmic::theme::Text::Color(if connected == 0 {
             palette.muted()
         } else {
             palette.fg()
@@ -520,11 +522,11 @@ impl State {
 
 /// What the bar cell draws, and nothing else. Must mirror `view`: an absent
 /// adapter hides the module, an unpowered one draws the off glyph alone, and a
-/// powered one draws the connected count (which picks the glyph and its
-/// colour), the single connected device's name exactly as `view` elides it, and
-/// the worst connected battery with the tier that colours it. Scanning is not in
-/// here: it belongs to the popup's scan button, not the cell. Two snapshots with
-/// the same key paint the same pixels, so the second one is not worth a relayout.
+/// powered one draws the connected count - which picks the glyph, its colour,
+/// and whether a number is printed at all - beside the worst connected battery
+/// with the tier that colours it. Neither the connected device's name nor the
+/// scan belongs in here: both are the popup's. Two snapshots with the same key
+/// paint the same pixels, so the second one is not worth a relayout.
 #[derive(Debug, PartialEq, Eq)]
 enum BarKey {
     /// `view` returned `None`: no adapter, so no cell at all.
@@ -532,9 +534,6 @@ enum BarKey {
     Off,
     On {
         connected: usize,
-        /// Set only when a single device is connected, the one case where the
-        /// cell prints a name instead of a count.
-        name: Option<String>,
         /// Percentage of the worst connected battery, and its colour tier.
         battery: Option<(u8, u8)>,
     },
@@ -557,10 +556,8 @@ impl Snapshot {
         if !adapter.powered {
             return BarKey::Off;
         }
-        let connected: Vec<&Device> = self.connected().collect();
         BarKey::On {
-            connected: connected.len(),
-            name: (connected.len() == 1).then(|| elide(&connected[0].name, NAME_LIMIT)),
+            connected: self.connected().count(),
             battery: self
                 .worst_battery()
                 .map(|battery| (battery, battery_tier(battery))),

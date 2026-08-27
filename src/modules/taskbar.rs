@@ -9,6 +9,7 @@
 //! window on this output grouped by workspace: a window switcher waybar has no
 //! way to draw.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
-use cosmic::iced::{Alignment, Background, Color, Length, Subscription};
+use cosmic::iced::{Alignment, Color, Length, Subscription};
 use cosmic::widget;
 use cosmic::{Apply, Element};
 use niri_ipc::socket::Socket;
@@ -28,6 +29,7 @@ use niri_ipc::{
 use crate::bar::Message;
 use crate::config::TaskbarScope;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::{Island, Palette};
 
 /// base, the role the waybar `#taskbar` island borrowed from `@backlight`.
@@ -42,6 +44,9 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 const CLOSE_ICON: &str = "\u{f00d}";
 /// `md-bell_outline`, for a window asking for attention.
 const URGENT_ICON: &str = "\u{f009c}";
+/// The letter tile for a window that has no app_id at all, and so no letter of
+/// its own to draw.
+const UNKNOWN_LETTER: &str = "?";
 /// Longest window title in the popup, which is much wider.
 const POPUP_TITLE_LIMIT: usize = 44;
 /// Item corner radius; items sit inside the island so they stay tighter.
@@ -81,16 +86,57 @@ pub enum Event {
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// Every open window, keyed by id; ordering is derived in `view`.
+    /// Every open window, keyed by id. `order` holds the sequence they draw in.
     windows: HashMap<u64, Window>,
     /// In niri's own order: grouped per output, by index.
     workspaces: Vec<Workspace>,
-    /// Which windows the strip lists. Reloading the config replaces the bar's
-    /// `Config` without rebuilding module state, so this arrives as an event.
-    /// app_id -> resolved icon file. Resolved once per app_id when the window
-    /// arrives, never per frame: the freedesktop lookup touches the disk.
-    icons: HashMap<String, Option<PathBuf>>,
+    /// The strip's and the popup's draw order, one entry per output.
+    order: Vec<OutputOrder>,
+    /// app_id -> what its windows draw as. Resolved once per app_id when the
+    /// window arrives, never per frame: the freedesktop lookup touches the disk.
+    icons: HashMap<String, AppIcon>,
     connected: bool,
+}
+
+/// One output's workspaces, in the order the bar lists them.
+///
+/// The order is derived from both niri tables and kept rather than recomputed,
+/// because a bar surface redraws on every message the bar handles — a cpu
+/// sample, a clock tick, a pointer leaving a cell — and none of those can move
+/// a window.
+#[derive(Debug)]
+struct OutputOrder {
+    /// `None` from a compositor that never named its outputs.
+    name: Option<String>,
+    workspaces: Vec<WorkspaceOrder>,
+}
+
+#[derive(Debug)]
+struct WorkspaceOrder {
+    id: u64,
+    /// The popup's heading for it, formatted here because it follows the
+    /// workspace table and not the frame.
+    heading: String,
+    /// Which workspace its output is showing, and which one has the keyboard:
+    /// what `taskbar_scope = "workspace"` picks with.
+    active: bool,
+    focused: bool,
+    /// Its windows by id, left to right as the compositor lays them out.
+    windows: Vec<u64>,
+}
+
+/// What one app_id draws as, in the form the widget takes.
+///
+/// A frame draws every visible item, so anything left undone here — rebuilding
+/// a handle from a path, uppercasing a letter — is work per item per frame.
+#[derive(Debug)]
+enum AppIcon {
+    /// A theme or desktop-entry icon file. `icon::Handle` is what
+    /// `widget::icon::icon` consumes, and for the SVGs an icon theme is made
+    /// of, cloning one is a refcount bump.
+    File(widget::icon::Handle),
+    /// The app has no icon anywhere, so its windows are letter tiles instead.
+    Letter(Box<str>),
 }
 
 impl State {
@@ -102,6 +148,17 @@ impl State {
     }
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
+        // Which events can move a window or a workspace, and so invalidate the
+        // derived order. Focus and urgency only repaint what is already placed.
+        let reorder = matches!(
+            event,
+            Event::Windows(_)
+                | Event::Changed(_)
+                | Event::Closed(_)
+                | Event::Layouts(_)
+                | Event::Workspaces(_)
+                | Event::WorkspaceActivated { .. }
+        );
         match event {
             Event::Windows(windows) => {
                 self.windows.clear();
@@ -193,6 +250,9 @@ impl State {
             Event::Acted(Err(error)) => log::warn!("taskbar: {error}"),
             Event::Acted(Ok(())) => {}
         }
+        if reorder {
+            self.reorder();
+        }
         Task::none()
     }
 
@@ -202,7 +262,8 @@ impl State {
     pub fn view(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
         let windows = self.strip(ctx.output.as_deref(), ctx.taskbar_scope);
-        if windows.is_empty() {
+        let total = windows.clone().count();
+        if total == 0 {
             return None;
         }
 
@@ -216,15 +277,15 @@ impl State {
         let per_item = f32::from(icon_size) + 2.0 * ITEM_PAD_X + ITEM_SPACING;
         let shown = match ctx.width {
             Some(width) => ((width * STRIP_SHARE / per_item).floor() as usize).max(1),
-            None => windows.len(),
+            None => total,
         };
-        let hidden = windows.len().saturating_sub(shown);
+        let hidden = total.saturating_sub(shown);
 
         let mut row = widget::Row::new()
             .spacing(ITEM_SPACING)
             .align_y(Alignment::Center);
 
-        for window in windows.into_iter().take(shown) {
+        for window in windows.take(shown).filter_map(|id| self.windows.get(&id)) {
             // Icons only: a title per window is what made the waybar taskbar
             // eat the whole left third of the bar. The title lives in the
             // tooltip and in the popup, where there is room for it.
@@ -270,161 +331,136 @@ impl State {
         Some(row.into())
     }
 
-    /// Every window on this output, grouped by workspace: the switcher waybar
-    /// could not draw. Rows focus, and each has its own close button.
     /// Mirrors `popup`'s own test, so the bar can ask which cells are
     /// clickable without building any popup's contents.
     pub fn has_popup(&self) -> bool {
         true
     }
 
+    /// Every window on this output, grouped by workspace: the switcher waybar
+    /// could not draw. Rows focus, and each has its own close button.
+    ///
+    /// The list has no upper bound — it is every window on the output — so it
+    /// is the card's one scrolling block, headings and all.
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
         let icon_size = icon_size(ctx);
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
+        let mut list = popup::column();
         let mut total = 0usize;
 
-        for workspace in self.row(ctx.output.as_deref()) {
-            let windows = self.ordered(workspace.id);
-            if windows.is_empty() {
+        for workspace in self.workspaces_of(ctx.output.as_deref()) {
+            if workspace.windows.is_empty() {
                 continue;
             }
-            total += windows.len();
+            total += workspace.windows.len();
+            // A heading is a row like any other because clicking it switches to
+            // that workspace.
+            list = list.push(popup::row(
+                popup::section(workspace.heading.as_str(), ctx),
+                palette,
+                Some(event_message(Event::FocusWorkspace(workspace.id))),
+            ));
 
-            let heading = match &workspace.name {
-                Some(name) => format!("{} · {name}", workspace.idx),
-                None => format!("workspace {}", workspace.idx),
-            };
-            let heading_color = if workspace.is_active {
-                palette.accent()
-            } else {
-                palette.muted()
-            };
-            body = body.push(
-                crate::theme::text(heading)
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(heading_color))
-                    .align_y(Alignment::Center)
-                    .apply(widget::button::custom)
-                    .width(Length::Fill)
-                    .padding([2.0, 4.0])
-                    .class(ghost_class(palette, heading_color, palette.accent()))
-                    .on_press(event_message(Event::FocusWorkspace(workspace.id))),
-            );
-
-            for window in windows {
-                let mut lines = widget::Column::new()
-                    .push(
-                        crate::theme::text(elide(title_of(window), POPUP_TITLE_LIMIT))
-                            .size(ctx.font_size),
-                    )
-                    .spacing(1)
-                    .width(Length::Fill);
+            for window in workspace.windows.iter().filter_map(|id| self.windows.get(id)) {
+                let mut lines = popup::lines()
+                    .push(popup::item(elide(title_of(window), POPUP_TITLE_LIMIT), ctx));
                 if let Some(app_id) = window.app_id.as_deref() {
-                    lines = lines.push(
-                        crate::theme::text(app_id.to_string())
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.overlay0)),
-                    );
+                    lines = lines.push(popup::detail(app_id, ctx));
                 }
-
                 let entry = widget::Row::new()
                     .push(self.icon(window, icon_size))
                     .push(lines)
                     .push_maybe(window.is_urgent.then(|| {
                         crate::theme::icon_text(URGENT_ICON)
-                            .size(ctx.font_size)
+                            .size(ctx.small())
                             .class(cosmic::theme::Text::Color(palette.red))
                     }))
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .apply(widget::button::custom)
-                    .width(Length::Fill)
-                    .padding([3.0, 6.0])
-                    // A popup row is a menu item: it highlights at once, the
-                    // way every menu does, so only the bar's own strip fades.
-                    .class({
-                        let (text_color, background) = item_colors(
-                            palette,
-                            window.is_focused,
-                            window.is_urgent,
-                            self.connected,
-                        );
-                        button_class(palette, text_color, background, text_color)
-                    })
-                    .on_press(event_message(Event::Focus {
-                        id: window.id,
-                        from_popup: true,
-                    }));
-
-                body = body.push(
-                    widget::Row::new()
-                        .push(entry)
-                        .push(
-                            crate::theme::icon_text(CLOSE_ICON)
-                                .size(ctx.font_size)
-                                .apply(widget::button::custom)
-                                .padding([3.0, 7.0])
-                                .class(ghost_class(palette, palette.overlay0, palette.red))
-                                .on_press(event_message(Event::Close(window.id))),
-                        )
-                        .spacing(4)
-                        .align_y(Alignment::Center),
-                );
+                    .spacing(popup::ROW_GAP)
+                    .align_y(Alignment::Center);
+                // Closing sits beside the row rather than in it: a button
+                // cannot be nested inside another button's content.
+                list = list.push(popup::split(
+                    popup::row(
+                        entry,
+                        palette,
+                        Some(event_message(Event::Focus {
+                            id: window.id,
+                            from_popup: true,
+                        })),
+                    ),
+                    [popup::icon_chip(
+                        CLOSE_ICON,
+                        Chip::Danger,
+                        ctx,
+                        Some(event_message(Event::Close(window.id))),
+                    )],
+                ));
             }
         }
 
-        if total == 0 {
-            body = body.push(
-                crate::theme::text("no windows on this output")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
+        let mut card = Card::new().block(popup::split(
+            popup::title(
+                match total {
+                    1 => "1 window".to_owned(),
+                    total => format!("{total} windows"),
+                },
+                ctx,
+            ),
+            [],
+        ));
+        if total > 0 {
+            card = card.list(list);
         }
-        if !self.connected {
-            body = body.push(
-                crate::theme::text("reconnecting to niri…")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.peach)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe((total == 0).then(|| popup::detail("no windows on this output", ctx)))
+                .maybe((!self.connected).then(|| {
+                    popup::detail("reconnecting to niri…", ctx)
+                        .class(cosmic::theme::Text::Color(palette.peach))
+                }))
+                .build(),
+        )
     }
 
     pub fn fast_tick(&self, _open: bool) -> bool {
         false
     }
 
-    /// The workspaces of one output, top to bottom by index. niri's table
-    /// order is unspecified — `Request::Workspaces` really does hand back
-    /// 3, 2, 1 — so the order is imposed here. An unknown output name means
-    /// "everything", so a compositor that never told us an output name still
-    /// gets a usable bar.
-    fn row(&self, output: Option<&str>) -> Vec<&Workspace> {
-        let mut row: Vec<&Workspace> = self
-            .workspaces
-            .iter()
-            .filter(|workspace| {
-                output.is_none_or(|output| workspace.output.as_deref() == Some(output))
-            })
-            .collect();
-        row.sort_unstable_by(|a, b| a.output.cmp(&b.output).then(a.idx.cmp(&b.idx)));
-        row
+    /// The workspaces a frame draws from, top to bottom by index.
+    ///
+    /// The output is resolved up front rather than filtered on as the iterator
+    /// runs: the popup hands back rows borrowed from `self`, and an iterator
+    /// that also held the frame's output name would shorten them to the frame.
+    fn workspaces_of<'a>(
+        &'a self,
+        output: Option<&str>,
+    ) -> impl Iterator<Item = &'a WorkspaceOrder> + Clone {
+        let groups: &[OutputOrder] = match output {
+            // Each output appears once in the order, so its workspaces are one
+            // run of it.
+            Some(name) => self
+                .order
+                .iter()
+                .position(|group| group.name.as_deref() == Some(name))
+                .map_or(&[], |at| &self.order[at..=at]),
+            // An unknown output name means "everything", so a compositor that
+            // never told us an output name still gets a usable bar.
+            None => &self.order,
+        };
+        groups.iter().flat_map(|group| group.workspaces.iter())
     }
 
     /// The workspace currently on screen for this output. With no output name
     /// the focused workspace is the only sensible answer.
-    fn visible_workspace(&self, output: Option<&str>) -> Option<&Workspace> {
+    fn visible_workspace(&self, output: Option<&str>) -> Option<&WorkspaceOrder> {
+        let mut row = self.workspaces_of(output);
         match output {
-            Some(_) => {
-                let row = self.row(output);
-                row.iter()
-                    .find(|workspace| workspace.is_active)
-                    .or_else(|| row.iter().find(|workspace| workspace.is_focused))
-                    .copied()
-            }
-            None => self.workspaces.iter().find(|workspace| workspace.is_focused),
+            // Every output has an active workspace; the focused one is the
+            // fallback for a compositor that has not said which.
+            Some(_) => row
+                .clone()
+                .find(|workspace| workspace.active)
+                .or_else(|| row.find(|workspace| workspace.focused)),
+            None => row.find(|workspace| workspace.focused),
         }
     }
 
@@ -432,42 +468,88 @@ impl State {
     /// output workspace by workspace, or only what that output is showing.
     /// An empty workspace contributes nothing, so a gap in the workspace
     /// numbering costs nothing either.
-    fn strip(&self, output: Option<&str>, scope: TaskbarScope) -> Vec<&Window> {
-        match scope {
-            TaskbarScope::Output => self
-                .row(output)
-                .into_iter()
-                .flat_map(|workspace| self.ordered(workspace.id))
-                .collect(),
-            TaskbarScope::Workspace => self
-                .visible_workspace(output)
-                .map(|workspace| self.ordered(workspace.id))
-                .unwrap_or_default(),
-        }
+    ///
+    /// An iterator rather than a `Vec`, because `view` runs on every message
+    /// the bar handles and only ever needs this length and its first few ids.
+    fn strip(
+        &self,
+        output: Option<&str>,
+        scope: TaskbarScope,
+    ) -> impl Iterator<Item = u64> + Clone {
+        // `Workspace` scope is `Output` scope narrowed to one workspace, which
+        // keeps both scopes on one iterator type. A narrowed scope with no
+        // visible workspace matches nothing, which is the empty strip it is.
+        let narrow = matches!(scope, TaskbarScope::Workspace);
+        let visible = narrow
+            .then(|| self.visible_workspace(output).map(|workspace| workspace.id))
+            .flatten();
+        self.workspaces_of(output)
+            .filter(move |workspace| !narrow || Some(workspace.id) == visible)
+            .flat_map(|workspace| workspace.windows.iter().copied())
     }
 
-    /// The windows of one workspace, left to right as the compositor lays them
-    /// out: by column then row, with floating windows trailing.
-    fn ordered(&self, workspace: u64) -> Vec<&Window> {
-        let mut windows: Vec<&Window> = self
-            .windows
-            .values()
-            .filter(|window| window.workspace_id == Some(workspace))
-            .collect();
-        windows.sort_unstable_by_key(|window| {
+    /// Rebuild the draw order from the window and workspace tables. Called
+    /// from `update` for the events that can change it, which is what keeps it
+    /// out of every frame.
+    fn reorder(&mut self) {
+        // One pass over the windows: asking each workspace which windows are on
+        // it instead rescans the whole table per workspace.
+        let mut placed: HashMap<u64, Vec<(usize, usize, u64)>> = HashMap::new();
+        for window in self.windows.values() {
+            let Some(workspace) = window.workspace_id else {
+                continue;
+            };
             let (column, tile) = window
                 .layout
                 .pos_in_scrolling_layout
                 // Floating windows have no slot in the scrolling layout; they
                 // go after the tiled ones instead of jumping to the front.
                 .unwrap_or((usize::MAX, usize::MAX));
-            (column, tile, window.id)
-        });
-        windows
+            placed
+                .entry(workspace)
+                .or_default()
+                .push((column, tile, window.id));
+        }
+        // Left to right as the compositor lays them out: by column, then row,
+        // then by id so the order does not wobble between two equal slots.
+        for windows in placed.values_mut() {
+            windows.sort_unstable();
+        }
+
+        // niri's workspace table order is unspecified — `Request::Workspaces`
+        // really does hand back 3, 2, 1 — so the row order is imposed here, and
+        // the per-output groups then fall out as runs of one output name.
+        let mut workspaces: Vec<&Workspace> = self.workspaces.iter().collect();
+        workspaces.sort_unstable_by(|a, b| a.output.cmp(&b.output).then(a.idx.cmp(&b.idx)));
+
+        let mut order: Vec<OutputOrder> = Vec::new();
+        for workspace in workspaces {
+            let group = WorkspaceOrder {
+                id: workspace.id,
+                heading: match &workspace.name {
+                    Some(name) => format!("{} · {name}", workspace.idx),
+                    None => format!("workspace {}", workspace.idx),
+                },
+                active: workspace.is_active,
+                focused: workspace.is_focused,
+                windows: placed
+                    .remove(&workspace.id)
+                    .map(|windows| windows.into_iter().map(|(_, _, id)| id).collect())
+                    .unwrap_or_default(),
+            };
+            match order.last_mut() {
+                Some(last) if last.name == workspace.output => last.workspaces.push(group),
+                _ => order.push(OutputOrder {
+                    name: workspace.output.clone(),
+                    workspaces: vec![group],
+                }),
+            }
+        }
+        self.order = order;
     }
 
-    /// Resolve and remember this window's app icon. Called when window data
-    /// arrives, so `view` never touches the filesystem.
+    /// Resolve and remember what this window's app draws as. Called when window
+    /// data arrives, so no frame touches the filesystem.
     fn learn_icon(&mut self, window: &Window) {
         let Some(app_id) = window.app_id.as_deref() else {
             return;
@@ -475,34 +557,27 @@ impl State {
         if self.icons.contains_key(app_id) {
             return;
         }
-        self.icons.insert(app_id.to_string(), lookup_icon(app_id));
+        let icon = match lookup_icon(app_id) {
+            Some(path) => AppIcon::File(widget::icon::from_path(path)),
+            None => AppIcon::Letter(letter_of(app_id)),
+        };
+        self.icons.insert(app_id.to_string(), icon);
     }
 
     /// The themed app icon, or a letter tile when the app has no icon.
     /// Now that the strip is icons only, this is the whole item: it must always
     /// produce something clickable, even for a window with no app_id at all.
     fn icon(&self, window: &Window, size: u16) -> Element<'_, Message> {
-        let app_id = window.app_id.as_deref().unwrap_or_default();
-        match self.icons.get(app_id) {
-            Some(Some(path)) => widget::icon::icon(widget::icon::from_path(path.clone()))
-                .size(size)
-                .into(),
-            _ => {
-                let letter = app_id
-                    .chars()
-                    .find(|c| c.is_alphanumeric())
-                    .unwrap_or('?')
-                    .to_uppercase()
-                    .to_string();
-                crate::theme::text(letter)
-                    .size(f32::from(size) * 0.75)
-                    .apply(widget::container)
-                    .width(Length::Fixed(f32::from(size)))
-                    .height(Length::Fixed(f32::from(size)))
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center)
-                    .into()
-            }
+        match window
+            .app_id
+            .as_deref()
+            .and_then(|app_id| self.icons.get(app_id))
+        {
+            Some(AppIcon::File(handle)) => widget::icon::icon(handle.clone()).size(size).into(),
+            Some(AppIcon::Letter(letter)) => letter_tile(letter, size),
+            // A window with no app_id was never resolved, so it has no letter
+            // of its own.
+            None => letter_tile(UNKNOWN_LETTER, size),
         }
     }
 }
@@ -522,6 +597,29 @@ fn title_of(window: &Window) -> &str {
 /// its text: they fill it, minus the island's own breathing room.
 fn icon_size(ctx: &Ctx) -> u16 {
     ((ctx.height as f32 * 0.75).round() as u16).clamp(12, 28)
+}
+
+/// A window with no icon still has to be the size of one, so its letter sits in
+/// a box as big as the icon it stands in for.
+fn letter_tile<'a>(letter: &'a str, size: u16) -> Element<'a, Message> {
+    crate::theme::text(letter)
+        .size(f32::from(size) * 0.75)
+        .apply(widget::container)
+        .width(Length::Fixed(f32::from(size)))
+        .height(Length::Fixed(f32::from(size)))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// The letter an app with no icon draws instead. A string rather than a `char`
+/// because `char::to_uppercase` is an iterator: one letter can upcase to
+/// several.
+fn letter_of(app_id: &str) -> Box<str> {
+    match app_id.chars().find(|c| c.is_alphanumeric()) {
+        Some(first) => first.to_uppercase().collect::<String>().into_boxed_str(),
+        None => UNKNOWN_LETTER.into(),
+    }
 }
 
 /// `Named::path` is the only way to tell a hit from a miss: `handle()` quietly
@@ -681,52 +779,16 @@ fn item_fill(palette: Palette, background: Option<Color>) -> crate::fill::Fill {
     }
 }
 
-/// A borderless button that only colours its label: workspace headings and the
-/// close buttons in the popup.
-fn ghost_class(palette: Palette, text_color: Color, hover_color: Color) -> cosmic::theme::Button {
-    button_class(palette, text_color, None, hover_color)
-}
-
-fn button_class(
-    palette: Palette,
-    text_color: Color,
-    background: Option<Color>,
-    hover_color: Color,
-) -> cosmic::theme::Button {
-    let style = move |background: Option<Color>, text_color: Color| cosmic::widget::button::Style {
-        shadow_offset: cosmic::iced::Vector::ZERO,
-        background: background.map(Background::Color),
-        overlay: None,
-        border_radius: ITEM_RADIUS.into(),
-        border_width: 0.0,
-        border_color: Color::TRANSPARENT,
-        outline_width: 0.0,
-        outline_color: Color::TRANSPARENT,
-        icon_color: Some(text_color),
-        text_color: Some(text_color),
-    };
-    // A filled item keeps its own colour under the pointer; an unfilled one
-    // lights up, which is the affordance the waybar `:hover` rules gave. The
-    // lift is measured from the island the strip sits on.
-    let island = ISLAND.color(&palette).unwrap_or_else(|| palette.bar_bg());
-    let hovered = background.or(Some(palette.hover_over(island)));
-    cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, _theme| style(background, text_color)),
-        hovered: Box::new(move |_focused, _theme| style(hovered, hover_color)),
-        pressed: Box::new(move |_focused, _theme| style(
-            background.or(Some(palette.press_over(island))),
-            hover_color,
-        )),
-        disabled: Box::new(move |_theme| style(background, text_color)),
-    }
-}
-
-fn elide(text: &str, limit: usize) -> String {
+/// A title as the popup shows it. A `Cow` because the popup is rebuilt on every
+/// frame it is open and almost every title already fits: only the long ones pay
+/// for a copy.
+fn elide(text: &str, limit: usize) -> Cow<'_, str> {
     if text.chars().count() <= limit {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
-    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
-    format!("{kept}…")
+    let mut kept: String = text.chars().take(limit.saturating_sub(1)).collect();
+    kept.push('…');
+    Cow::Owned(kept)
 }
 
 /// Run one niri action off the UI thread and report the outcome back.

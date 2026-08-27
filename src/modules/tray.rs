@@ -35,6 +35,7 @@ use system_tray::menu::{
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar painted the tray island `@tray`, which is `@mantle`.
@@ -203,7 +204,7 @@ impl State {
             }
             Event::Removed(address) => {
                 self.items.retain(|item| item.address != address);
-                if self.selected.as_deref() == Some(address.as_str()) {
+                if self.selected.as_deref() == Some(&*address) {
                     self.selected = None;
                     self.expanded.clear();
                     // The popup was showing a menu that no longer exists.
@@ -246,8 +247,8 @@ impl State {
                 };
                 // The menu acted; leaving it open would be a stale menu.
                 self.request(ActivateRequest::MenuItem {
-                    address,
-                    menu_path,
+                    address: address.to_string(),
+                    menu_path: menu_path.to_string(),
                     submenu_id: id,
                 })
                 .chain(Task::done(cosmic::Action::App(Message::ClosePopup)))
@@ -288,48 +289,33 @@ impl State {
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let item = self.target()?;
-        let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
+        let mut card = Card::new();
 
+        // One popup walks every item's menu, so it has to say whose menu is on
+        // screen and offer the others.
         if self.items.len() > 1 {
-            let size = icon_size(ctx);
-            let mut selector = widget::Row::new().spacing(4).align_y(Alignment::Center);
+            let mut selector = widget::Row::new().spacing(popup::ROW_GAP);
             for candidate in &self.items {
                 let current = candidate.address == item.address;
-                selector = selector.push(if current {
-                    widget::button::custom(candidate.visual(size, ctx))
-                        .padding(4)
-                        .class(crate::theme::chip_accent(palette))
-                        .into()
-                } else {
-                    // The one the popup is not showing: flat until the pointer
-                    // arrives, and it fades in like a bar cell.
-                    crate::fill::fill(
-                        widget::button::custom(candidate.visual(size, ctx))
-                            .padding(4)
-                            .class(crate::theme::cell(palette.fg(), crate::theme::ROW_CORNERS))
-                            .on_press(event_message(Event::Select(candidate.address.clone()))),
-                        crate::theme::row_fill(palette),
-                        crate::theme::ROW_CORNERS,
-                    )
-                });
+                selector = selector.push(popup::chip(
+                    candidate.label(),
+                    match current {
+                        true => Chip::Accent,
+                        false => Chip::Plain,
+                    },
+                    ctx,
+                    (!current).then(|| event_message(Event::Select(candidate.address.clone()))),
+                ));
             }
-            body = body
-                .push(selector)
-                .push(widget::divider::horizontal::default());
+            // A tray of a dozen items is a strip too long for one line.
+            card = card.block(selector.wrap());
         }
 
-        body = body.push(
-            crate::theme::text(item.label())
-                .class(cosmic::theme::Text::Color(palette.accent())),
-        );
+        let mut header = popup::lines().push(popup::title(item.label(), ctx));
         if let Some(tooltip) = &item.tooltip {
-            body = body.push(
-                crate::theme::text(tooltip.as_str())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
+            header = header.push(popup::detail(tooltip.as_str(), ctx));
         }
+        card = card.block(header);
 
         let entries: &[MenuItem] = item
             .menu
@@ -338,44 +324,46 @@ impl State {
             .unwrap_or_default();
         let mut rows: Vec<Element<'_, Message>> = Vec::new();
         self.menu_rows(&item.address, entries, 0, ctx, &mut rows);
-        if rows.is_empty() {
-            body = body.push(
-                crate::theme::text("no menu")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.overlay0)),
-            );
-        } else {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(widget::Column::with_children(rows).spacing(1));
-        }
-
-        body = body
-            .push(widget::divider::horizontal::default())
-            .push(
-                widget::Row::new()
-                    .push(
-                        widget::button::text("activate")
-                            .class(crate::theme::chip(palette))
-                            .on_press(event_message(Event::Activate(item.address.clone()))),
-                    )
-                    .push(
-                        widget::button::text("secondary")
-                            .class(crate::theme::chip(palette))
-                            .on_press(event_message(Event::Secondary(item.address.clone()))),
-                    )
-                    .spacing(6),
-            );
-
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.as_str())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
+        let has_menu = !rows.is_empty();
+        if has_menu {
+            // An app's menu is as long as the app decided; scrolling it is what
+            // keeps the header and the verbs below on screen instead of letting
+            // a twenty-entry menu run past the popup's edge and be clipped.
+            card = card.list(
+                rows.into_iter()
+                    .fold(popup::column(), |list, row| list.push(row)),
             );
         }
 
-        Some(body.apply(widget::container).padding(12).into())
+        let note: Element<'_, Message> = match has_menu {
+            true => widget::space::horizontal().into(),
+            false => popup::detail("no menu", ctx).into(),
+        };
+        card = card.block(popup::split(
+            note,
+            [
+                popup::chip(
+                    "activate",
+                    Chip::Accent,
+                    ctx,
+                    Some(event_message(Event::Activate(item.address.clone()))),
+                ),
+                popup::chip(
+                    "secondary",
+                    Chip::Plain,
+                    ctx,
+                    Some(event_message(Event::Secondary(item.address.clone()))),
+                ),
+            ],
+        ));
+
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx)
+                    .class(cosmic::theme::Text::Color(ctx.palette.red))
+            }))
+            .build(),
+        )
     }
 
     /// Nothing here changes per second.
@@ -384,11 +372,11 @@ impl State {
     }
 
     fn index_of(&self, address: &str) -> Option<usize> {
-        self.items.iter().position(|item| item.address == address)
+        self.items.iter().position(|item| &*item.address == address)
     }
 
     fn item(&self, address: &str) -> Option<&Item> {
-        self.items.iter().find(|item| item.address == address)
+        self.items.iter().find(|item| &*item.address == address)
     }
 
     /// The item the popup is about: the selected one, else the first.
@@ -399,15 +387,14 @@ impl State {
             .or_else(|| self.items.first())
     }
 
-    fn menu_path(&self, address: &str) -> Option<String> {
-        self.item(address)
-            .and_then(|item| item.menu_path.clone())
+    fn menu_path(&self, address: &str) -> Option<Arc<str>> {
+        self.item(address).and_then(|item| item.menu_path.clone())
     }
 
     /// Select an item and put its menu on screen. The bar owns the popup, so
     /// the surface is closed first and reopened: that is correct whether or
     /// not one was already up, and never leaves the two out of step.
-    fn open_menu(&mut self, address: String) -> Task<Message> {
+    fn open_menu(&mut self, address: Arc<str>) -> Task<Message> {
         self.expanded.clear();
         self.selected = Some(address.clone());
         self.about_to_show(address, 0)
@@ -419,7 +406,7 @@ impl State {
 
     /// `AboutToShow` lets an app fill a menu lazily; the layout it publishes
     /// afterwards arrives as a normal `Menu` update.
-    fn about_to_show(&self, address: String, id: i32) -> Task<Message> {
+    fn about_to_show(&self, address: Arc<str>, id: i32) -> Task<Message> {
         let Some(client) = self.client.clone() else {
             return Task::none();
         };
@@ -427,7 +414,9 @@ impl State {
             return Task::none();
         };
         Task::future(async move {
-            let result = client.about_to_show_menuitem(address, menu_path, id).await;
+            let result = client
+                .about_to_show_menuitem(address.to_string(), menu_path.to_string(), id)
+                .await;
             cosmic::Action::App(event_message(Event::Requested(
                 result.map(|_| ()).map_err(|error| error.to_string()),
             )))
@@ -456,7 +445,7 @@ impl State {
     /// most of them — actually lives at
     /// `/org/ayatana/NotificationItem/<id>`, so that call fails with
     /// `UnknownObject`. The watcher knows the real path, so ask it.
-    fn item_call(&self, address: String, call: ItemCall) -> Task<Message> {
+    fn item_call(&self, address: Arc<str>, call: ItemCall) -> Task<Message> {
         let Some(connection) = self.connection.clone() else {
             return Task::none();
         };
@@ -464,7 +453,7 @@ impl State {
             let result = async {
                 let path = item_path(&connection, &address).await;
                 let item = TrayItemProxy::builder(&connection)
-                    .destination(address)?
+                    .destination(address.to_string())?
                     .path(path)?
                     .build()
                     .await?;
@@ -488,7 +477,7 @@ impl State {
     /// submenus the user has expanded.
     fn menu_rows<'a>(
         &'a self,
-        address: &str,
+        address: &Arc<str>,
         entries: &'a [MenuItem],
         depth: usize,
         ctx: &Ctx,
@@ -501,11 +490,14 @@ impl State {
             if !entry.visible {
                 continue;
             }
+            // A separator divides one group of entries from the next within the
+            // menu, which is a single block of the card: the card's own
+            // hairlines mark where the menu ends, and cannot say this.
             if entry.menu_type == MenuType::Separator {
                 rows.push(
                     widget::divider::horizontal::default()
                         .apply(widget::container)
-                        .padding([3.0, indent + 4.0])
+                        .padding([0.0, indent])
                         .into(),
                 );
                 continue;
@@ -522,31 +514,37 @@ impl State {
                 (true, Disposition::Normal) => palette.fg(),
             };
 
-            let mut row = widget::Row::new().spacing(6).align_y(Alignment::Center);
+            let mut label = widget::Row::new()
+                .spacing(popup::ROW_GAP)
+                .align_y(Alignment::Center);
             if indent > 0.0 {
-                row = row.push(widget::space::horizontal().width(Length::Fixed(indent)));
+                label = label.push(widget::space::horizontal().width(Length::Fixed(indent)));
             }
             if let Some(mark) = toggle_mark(entry) {
-                row = row.push(
-                    crate::theme::icon_text(mark).class(cosmic::theme::Text::Color(color)),
+                label = label.push(
+                    crate::theme::icon_text(mark)
+                        .size(ctx.body())
+                        .class(cosmic::theme::Text::Color(color)),
                 );
             }
-            row = row.push(
-                crate::theme::text(mnemonic(entry.label.as_deref().unwrap_or("")))
-                    .class(cosmic::theme::Text::Color(color))
-                    .width(Length::Fill),
+            label = label.push(
+                popup::item(mnemonic(entry.label.as_deref().unwrap_or("")), ctx)
+                    .class(cosmic::theme::Text::Color(color)),
             );
+
+            let mut actions: Vec<Element<'a, Message>> = Vec::new();
             if let Some(shortcut) = shortcut(entry) {
-                row = row.push(
-                    crate::theme::text(shortcut)
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.overlay0)),
-                );
+                actions.push(popup::detail(shortcut, ctx).into());
             }
             if has_submenu {
-                row = row.push(
-                    crate::theme::icon_text(if expanded { SUBMENU_OPEN } else { SUBMENU_CLOSED })
-                        .class(cosmic::theme::Text::Color(color)),
+                actions.push(
+                    crate::theme::icon_text(match expanded {
+                        true => SUBMENU_OPEN,
+                        false => SUBMENU_CLOSED,
+                    })
+                    .size(ctx.body())
+                    .class(cosmic::theme::Text::Color(color))
+                    .into(),
                 );
             }
 
@@ -554,28 +552,11 @@ impl State {
                 (false, _) => None,
                 (true, true) => Some(event_message(Event::ToggleSubmenu(entry.id))),
                 (true, false) => Some(event_message(Event::MenuClick {
-                    address: address.to_owned(),
+                    address: address.clone(),
                     id: entry.id,
                 })),
             };
-            rows.push(match press {
-                Some(message) => crate::fill::fill(
-                    widget::button::custom(row)
-                        .padding([3.0, 6.0])
-                        .width(Length::Fill)
-                        .class(crate::theme::cell(color, crate::theme::ROW_CORNERS))
-                        .on_press(message),
-                    crate::theme::row_fill(palette),
-                    crate::theme::ROW_CORNERS,
-                ),
-                // A disabled entry still has to read as an entry, so it keeps
-                // the same box and only loses the press.
-                None => row
-                    .apply(widget::container)
-                    .padding([3.0, 6.0])
-                    .width(Length::Fill)
-                    .into(),
-            });
+            rows.push(popup::row(popup::split(label, actions), palette, press));
 
             if expanded {
                 self.menu_rows(address, &entry.submenu, depth + 1, ctx, rows);
@@ -585,7 +566,7 @@ impl State {
 }
 
 impl Item {
-    fn new(address: String, item: StatusNotifierItem) -> Self {
+    fn new(address: Arc<str>, item: StatusNotifierItem) -> Self {
         Self {
             address,
             id: item.id,
@@ -600,7 +581,7 @@ impl Item {
             theme_path: item.icon_theme_path,
             tooltip: item.tool_tip.as_ref().and_then(tooltip_text),
             item_is_menu: item.item_is_menu,
-            menu_path: item.menu,
+            menu_path: item.menu.map(Arc::from),
             menu: None,
             handle: None,
             overlay: None,
@@ -1054,14 +1035,14 @@ async fn session(
     {
         return Ok(());
     }
-    let known: Vec<(String, StatusNotifierItem, Option<TrayMenu>)> = client
+    let known: Vec<(Arc<str>, StatusNotifierItem, Option<TrayMenu>)> = client
         .items()
         .lock()
         .map(|items| {
             items
                 .iter()
                 .map(|(address, (item, menu))| {
-                    (address.clone(), item.clone(), menu.clone())
+                    (Arc::from(address.as_str()), item.clone(), menu.clone())
                 })
                 .collect()
         })
@@ -1084,17 +1065,25 @@ async fn session(
     loop {
         match events.recv().await {
             Ok(ClientEvent::Add(address, item)) => {
-                if sender.send(Event::Added(address, item)).await.is_err() {
+                if sender
+                    .send(Event::Added(address.into(), item))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
             Ok(ClientEvent::Update(address, update)) => {
-                if sender.send(Event::Updated(address, update)).await.is_err() {
+                if sender
+                    .send(Event::Updated(address.into(), update))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
             Ok(ClientEvent::Remove(address)) => {
-                if sender.send(Event::Removed(address)).await.is_err() {
+                if sender.send(Event::Removed(address.into())).await.is_err() {
                     return Ok(());
                 }
             }

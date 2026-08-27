@@ -12,14 +12,15 @@
 
 use std::time::{Duration, Instant};
 
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Alignment, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar: no island, `color: @accent`.
@@ -29,12 +30,6 @@ pub const ISLAND: Island = Island::Flat;
 /// belongs to the Suspend entry inside the menu; the bar cell gets the actual
 /// power symbol, because that is what the menu is.
 const ICON: &str = "\u{f0425}";
-
-/// Popup content width. The bar creates the popup surface at 360 logical
-/// pixels and lets `autosize` grow it afterwards, which a compositor placing a
-/// popup against the right screen edge cannot account for — this module is the
-/// rightmost one, so its card stays inside that budget.
-const POPUP_WIDTH: f32 = 300.0;
 
 /// How long an armed confirmation stays armed. Long enough to read the
 /// question, short enough that a popup reopened later is never pre-armed.
@@ -249,117 +244,88 @@ impl State {
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
-        let mut body = widget::Column::new()
-            .spacing(2)
-            .width(Length::Fixed(POPUP_WIDTH));
+        let mut menu = popup::column();
 
         for action in Action::MENU {
             let capability = self.capability(action);
             let armed = self.armed_for(action);
             let confirmation = action.confirmation();
-
             let usable = capability.usable();
-            // Text inside an armed row inherits the destructive button's own
-            // (dark) text colour; colouring it by hand makes it unreadable. An
-            // action the system cannot do reads as dimmed, because the label
-            // carries its own colour and the button's never reaches it.
-            let text_color = if armed {
-                palette.crust
-            } else if usable {
-                palette.fg()
-            } else {
-                palette.muted()
-            };
-            let content: Element<'_, Message> = match (armed, confirmation) {
-                (true, Some(question)) => widget::Row::new()
-                    .push(crate::theme::glyph_text(action.glyph(), ctx.font_size))
-                    .push(
-                        widget::Column::new()
-                            .push(crate::theme::text(question))
-                            .push(crate::theme::text("click again to confirm").size(ctx.small()))
-                            .spacing(1)
-                            .width(Length::Fill),
-                    )
-                    .spacing(crate::theme::GLYPH_GAP)
-                    .align_y(Alignment::Center)
-                    .into(),
-                _ => {
-                    let mut row = widget::Row::new()
-                        .push(crate::theme::label(
-                            action.glyph(),
-                            action.label(),
-                            ctx.font_size,
-                            cosmic::theme::Text::Color(text_color),
-                        ))
-                        .push(widget::space::horizontal())
-                        .spacing(10)
-                        .align_y(Alignment::Center);
-                    if let Some(note) = capability.note() {
-                        row = row.push(
-                            crate::theme::text(note)
-                                .size(ctx.small())
-                                .class(cosmic::theme::Text::Color(palette.muted())),
-                        );
-                    }
-                    row.into()
-                }
-            };
 
             let message = match (armed, confirmation.is_some()) {
                 // First click on a destructive entry only asks.
                 (false, true) => Event::Arm(action),
                 _ => Event::Fire(action),
             };
-            let entry = widget::button::custom(content)
-                .width(Length::Fill)
-                .padding([6, 10])
-                .class(if armed {
-                    crate::theme::chip_danger(palette)
-                } else {
-                    crate::theme::cell(text_color, crate::theme::ROW_CORNERS)
-                })
-                .on_press_maybe(usable.then(|| event_message(message)));
-            // An armed row already carries its own solid danger colour; every
-            // other row is transparent at rest and fades like a bar cell.
-            let entry: Element<'_, Message> = if armed {
-                entry.into()
-            } else if usable {
-                crate::fill::fill(
-                    entry,
-                    crate::theme::row_fill(palette),
-                    crate::theme::ROW_CORNERS,
-                )
-            } else {
-                // Nothing to offer: an unavailable action must not light up.
-                entry.into()
-            };
+            let on_press = usable.then(|| event_message(message));
 
-            body = if armed {
-                body.push(
-                    widget::Row::new()
-                        .push(entry)
-                        .push(
-                            widget::button::text("cancel")
-                                .class(crate::theme::chip(palette))
-                                .on_press(event_message(Event::Disarm)),
-                        )
-                        .spacing(6)
-                        .align_y(Alignment::Center),
+            let entry: Element<'_, Message> = match (armed, confirmation) {
+                (true, Some(question)) => popup::split(
+                    popup::row_armed(
+                        widget::Row::new()
+                            .push(crate::theme::glyph_text(action.glyph(), ctx.body()))
+                            .push(
+                                popup::lines()
+                                    .push(popup::item(question, ctx))
+                                    // An armed row hands its text the
+                                    // destructive button's own dark ink; the
+                                    // muted grey a detail carries everywhere
+                                    // else is unreadable on top of it.
+                                    .push(
+                                        popup::detail("click again to confirm", ctx)
+                                            .class(cosmic::theme::Text::Default),
+                                    ),
+                            )
+                            .spacing(crate::theme::GLYPH_GAP)
+                            .align_y(Alignment::Center),
+                        palette,
+                        on_press,
+                    ),
+                    [popup::chip(
+                        "cancel",
+                        Chip::Plain,
+                        ctx,
+                        Some(event_message(Event::Disarm)),
+                    )],
                 )
-            } else {
-                body.push(entry)
+                .into(),
+                _ => {
+                    let note: Option<Element<'_, Message>> = capability
+                        .note()
+                        .map(|note| popup::detail(note, ctx).into());
+                    popup::row(
+                        popup::split(
+                            crate::theme::label(
+                                action.glyph(),
+                                action.label(),
+                                ctx.body(),
+                                // An action the system cannot do reads as
+                                // dimmed, which the label has to carry itself:
+                                // the row's own text colour never reaches it.
+                                cosmic::theme::Text::Color(match usable {
+                                    true => palette.fg(),
+                                    false => palette.muted(),
+                                }),
+                            ),
+                            note,
+                        ),
+                        palette,
+                        on_press,
+                    )
+                }
             };
+            menu = menu.push(entry);
         }
 
-        if let Some(error) = &self.error {
-            body = body.push(widget::divider::horizontal::default()).push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(10).into())
+        Some(
+            Card::new()
+                .block(menu)
+                .maybe(self.error.as_ref().map(|error| {
+                    popup::detail(error.as_str(), ctx)
+                        .class(cosmic::theme::Text::Color(palette.red))
+                }))
+                .build(),
+        )
     }
 
     /// Ticking while armed is what lets the confirmation expire on its own,

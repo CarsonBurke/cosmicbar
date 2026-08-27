@@ -495,8 +495,7 @@ impl State {
             )],
         ))
         .maybe(self.error.as_ref().map(|error| {
-            popup::detail(error.as_str(), ctx)
-                .class(cosmic::theme::Text::Color(ctx.palette.red))
+            popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(ctx.palette.red))
         }))
     }
 

@@ -221,6 +221,19 @@ pub fn split<'a>(
     row
 }
 
+/// A group of actions with nothing to their left: a transport, a player picker,
+/// a row of presets. Same gap as [`split`], so a group of chips reads the same
+/// wherever it sits.
+pub fn actions<'a>(chips: impl IntoIterator<Item = Element<'a, Message>>) -> Row<'a> {
+    let mut row = widget::Row::new()
+        .spacing(ROW_GAP)
+        .align_y(Alignment::Center);
+    for chip in chips {
+        row = row.push(chip);
+    }
+    row
+}
+
 /// A column of items inside a block: rows of a list, lines of a section.
 pub fn column<'a>() -> Column<'a> {
     widget::Column::new().spacing(GAP).width(Length::Fill)

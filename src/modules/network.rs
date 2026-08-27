@@ -610,7 +610,7 @@ impl State {
                         ),
                     }
                 };
-                let name = cosmic::theme::Text::Color(if ap.active {
+                let name_class = cosmic::theme::Text::Color(if ap.active {
                     palette.green
                 } else {
                     palette.fg()
@@ -632,14 +632,11 @@ impl State {
                         wifi_icon(ap.strength),
                         elide(&ap.ssid, SSID_LIMIT),
                         ctx.body(),
-                        name,
+                        name_class,
                     ),
                     [
-                        popup::detail(
-                            format!("{}% · {}", ap.strength, band(ap.frequency)),
-                            ctx,
-                        )
-                        .into(),
+                        popup::detail(format!("{}% · {}", ap.strength, band(ap.frequency)), ctx)
+                            .into(),
                         security,
                         action,
                     ],
@@ -650,8 +647,7 @@ impl State {
 
         Some(
             card.maybe(self.error.as_ref().map(|error| {
-                popup::detail(error.as_str(), ctx)
-                    .class(cosmic::theme::Text::Color(palette.red))
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
             }))
             .build(),
         )
@@ -1603,12 +1599,12 @@ fn peel<'a>(value: &'a Value<'a>) -> &'a Value<'a> {
     }
 }
 
-fn field<'a>(props: &'a HashMap<String, OwnedValue>, key: &str) -> Option<&'a Value<'a>> {
+fn property<'a>(props: &'a HashMap<String, OwnedValue>, key: &str) -> Option<&'a Value<'a>> {
     props.get(key).map(|value| peel(value))
 }
 
 fn u32_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
-    match field(props, key)? {
+    match property(props, key)? {
         Value::U32(value) => Some(*value),
         Value::I32(value) => u32::try_from(*value).ok(),
         Value::U16(value) => Some(u32::from(*value)),
@@ -1619,7 +1615,7 @@ fn u32_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
 }
 
 fn u8_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<u8> {
-    match field(props, key)? {
+    match property(props, key)? {
         Value::U8(value) => Some(*value),
         Value::U32(value) => u8::try_from(*value).ok(),
         Value::I32(value) => u8::try_from(*value).ok(),
@@ -1628,14 +1624,14 @@ fn u8_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<u8> {
 }
 
 fn bool_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
-    match field(props, key)? {
+    match property(props, key)? {
         Value::Bool(value) => Some(*value),
         _ => None,
     }
 }
 
 fn string_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-    match field(props, key)? {
+    match property(props, key)? {
         Value::Str(value) => Some(value.as_str().to_owned()),
         Value::ObjectPath(value) => Some(value.as_str().to_owned()),
         _ => None,
@@ -1643,7 +1639,7 @@ fn string_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
 }
 
 fn path_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
-    match field(props, key)? {
+    match property(props, key)? {
         Value::ObjectPath(value) => Some(value.as_str().to_owned()),
         Value::Str(value) => Some(value.as_str().to_owned()),
         _ => None,
@@ -1651,7 +1647,7 @@ fn path_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
 }
 
 fn paths_of(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<String> {
-    let Some(Value::Array(array)) = field(props, key) else {
+    let Some(Value::Array(array)) = property(props, key) else {
         return Vec::new();
     };
     array
@@ -1667,7 +1663,7 @@ fn paths_of(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<String> {
 
 /// `ay` SSID, which is bytes and not guaranteed to be UTF-8.
 fn ssid_of(props: &HashMap<String, OwnedValue>) -> Option<String> {
-    let Value::Array(array) = field(props, "Ssid").or_else(|| field(props, "ssid"))? else {
+    let Value::Array(array) = property(props, "Ssid").or_else(|| property(props, "ssid"))? else {
         return None;
     };
     let bytes: Vec<u8> = array
@@ -1684,7 +1680,7 @@ fn ssid_of(props: &HashMap<String, OwnedValue>) -> Option<String> {
 /// The `a{sv}` entries of an `aa{sv}` property, flattened to owned pairs so
 /// callers do not have to juggle zvariant lifetimes.
 fn dicts_of(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<Vec<(String, OwnedValue)>> {
-    let Some(Value::Array(array)) = field(props, key) else {
+    let Some(Value::Array(array)) = property(props, key) else {
         return Vec::new();
     };
     array

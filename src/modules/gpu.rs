@@ -481,7 +481,11 @@ impl State {
                             ICON_FAN,
                             "fan",
                             format!("{fan}%"),
-                            if fan == 0 { palette.muted() } else { palette.teal },
+                            if fan == 0 {
+                                palette.muted()
+                            } else {
+                                palette.teal
+                            },
                             ctx,
                         )),
                 );

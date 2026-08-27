@@ -280,10 +280,7 @@ impl State {
                                     .class(cosmic::theme::Text::Color(palette.overlay0))
                                     .into(),
                                 popup::detail(
-                                    format!(
-                                        "{:>5.0} MiB",
-                                        process.rss_bytes as f64 / (KIB * KIB)
-                                    ),
+                                    format!("{:>5.0} MiB", process.rss_bytes as f64 / (KIB * KIB)),
                                     ctx,
                                 )
                                 .class(cosmic::theme::Text::Color(palette.mauve))

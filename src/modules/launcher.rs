@@ -100,6 +100,7 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let mut menu = popup::column();
         for entry in entries(ctx) {
+            let hint: Element<'_, Message> = popup::detail(entry.hint, ctx).into();
             menu = menu.push(popup::row(
                 popup::split(
                     crate::theme::label(
@@ -108,7 +109,7 @@ impl State {
                         ctx.body(),
                         cosmic::theme::Text::Color(ctx.palette.fg()),
                     ),
-                    [popup::detail(entry.hint, ctx).into()],
+                    [hint],
                 ),
                 ctx.palette,
                 Some(event_message(Event::Launch(entry.argv))),

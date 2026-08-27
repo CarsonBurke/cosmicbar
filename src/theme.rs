@@ -314,32 +314,6 @@ fn button(
     }
 }
 
-/// A clickable module cell. Whatever it sits on paints the background, so the
-/// cell is transparent until hovered; `radius` keeps the island's outer corners
-/// when neighbours are merged into one island, and `base` is the colour behind
-/// the cell, which is what the hover lifts away from so the feedback is visible
-/// on every island role and inside popups alike.
-pub fn module_button(palette: Palette, base: Color, radius: [f32; 4]) -> cosmic::theme::Button {
-    let style = move |background: Option<Color>| cosmic::widget::button::Style {
-        shadow_offset: cosmic::iced::Vector::ZERO,
-        background: background.map(Background::Color),
-        overlay: None,
-        border_radius: radius.into(),
-        border_width: 0.0,
-        border_color: Color::TRANSPARENT,
-        outline_width: 0.0,
-        outline_color: Color::TRANSPARENT,
-        icon_color: Some(palette.fg()),
-        text_color: Some(palette.fg()),
-    };
-    cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, _theme| style(None)),
-        hovered: Box::new(move |_focused, _theme| style(Some(palette.hover_over(base)))),
-        pressed: Box::new(move |_focused, _theme| style(Some(palette.press_over(base)))),
-        disabled: Box::new(move |_theme| style(None)),
-    }
-}
-
 /// A clickable surface on the bar: a module cell, a workspace pill, a taskbar
 /// item. `fill::fill` paints the background at every state, so the button only
 /// carries the text and icon colour and never repaints on hover - which is what

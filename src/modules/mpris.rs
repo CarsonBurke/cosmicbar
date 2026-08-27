@@ -313,9 +313,9 @@ impl State {
         // of it means anything, so the picker sits above the track rather than
         // beside it.
         if self.players.len() > 1 {
-            let mut picker = widget::Row::new().spacing(popup::ROW_GAP);
+            let mut picker = Vec::with_capacity(self.players.len());
             for other in self.players.iter() {
-                picker = picker.push(popup::chip(
+                picker.push(popup::chip(
                     elide(&other.identity, 14),
                     match other.bus == player.bus {
                         true => Chip::Accent,
@@ -325,7 +325,7 @@ impl State {
                     Some(event_message(Event::Select(other.bus.clone()))),
                 ));
             }
-            card = card.block(picker);
+            card = card.block(popup::actions(picker));
         }
 
         let mut track = popup::lines().push(popup::title(
@@ -378,33 +378,28 @@ impl State {
         }
 
         let playing = player.status == Status::Playing;
-        let transport = widget::Row::new()
-            .spacing(popup::ROW_GAP)
-            .push(control(
+        let transport = popup::actions([
+            control(
                 ctx,
                 PREVIOUS,
                 Chip::Plain,
                 player.can_previous.then_some(Action::Previous),
-            ))
-            .push(control(
+            ),
+            control(
                 ctx,
                 if playing { PAUSE } else { PLAY },
                 Chip::Accent,
                 // A player that can neither pause nor play has no transport.
                 (player.can_pause || player.can_play).then_some(Action::PlayPause),
-            ))
-            .push(control(
-                ctx,
-                NEXT,
-                Chip::Plain,
-                player.can_next.then_some(Action::Next),
-            ))
-            .push(control(
+            ),
+            control(ctx, NEXT, Chip::Plain, player.can_next.then_some(Action::Next)),
+            control(
                 ctx,
                 STOP,
                 Chip::Plain,
                 (player.status != Status::Stopped).then_some(Action::Stop),
-            ));
+            ),
+        ]);
 
         // Shuffle and loop are states rather than verbs, so they sit where a
         // block's actions sit and light up when they are on.

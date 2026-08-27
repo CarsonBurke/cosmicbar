@@ -242,7 +242,7 @@ impl State {
             )),
         );
         if dnd {
-            heading = heading.push(popup::detail("· dnd", ctx));
+            heading = heading.push(popup::detail("do not disturb", ctx));
         }
         let mut card = Card::new().block(popup::split(heading, []));
 

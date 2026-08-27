@@ -18,12 +18,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::introspect::{Introspector, SinkInfo, SinkInputInfo, SourceInfo};
@@ -36,6 +36,7 @@ use libpulse_binding::volume::{ChannelVolumes, Volume};
 use crate::bar::Message;
 use crate::modules::pointer::Pointer;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar painted `#pulseaudio` with `@volume`, which mocha maps to mantle.
@@ -55,8 +56,6 @@ const HEADSET_MUTED: &str = "\u{f02d0}";
 /// nf-md-microphone / _off: `format-source{,-muted}`.
 const MIC: &str = "\u{f036c}";
 const MIC_MUTED: &str = "\u{f036d}";
-/// nf-md-check: marks the device that is currently the default.
-const CHECK: &str = "\u{f012c}";
 
 /// Step per wheel notch. `volume.sh` defaulted to 1, but its keybinds pass 5.
 const STEP: u32 = 5;
@@ -384,125 +383,88 @@ impl State {
             return None;
         }
         let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(8).width(Length::Fill);
+        let mut card = Card::new();
 
+        // The output is what the module is about, so its device names the card
+        // and its level is the headline the card reports.
         if let Some(sink) = self.sink() {
-            body = body.push(self.device_section(ctx, "Output", Kind::Sink, sink, &self.sinks));
+            let pct = self.shown(Kind::Sink, sink.index, sink.pct);
+            card = card
+                .block(popup::split(
+                    popup::title(elide(&sink.description, 30), ctx),
+                    [popup::title(format!("{pct}%"), ctx)
+                        .class(cosmic::theme::Text::Color(palette.accent()))
+                        .into()],
+                ))
+                .block(
+                    popup::column()
+                        .push(popup::section("output", ctx))
+                        .push(self.slider_row(ctx, Kind::Sink, sink.index, pct, sink.mute, true)),
+                );
+            if self.sinks.len() > 1 {
+                card = card.block(switch_block(ctx, Kind::Sink, sink, &self.sinks));
+            }
         }
+
+        // The input names its own device: the card's title is already spoken
+        // for, and a microphone the bar is about to unmute is worth naming.
         if let Some(source) = self.source() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(self.device_section(ctx, "Input", Kind::Source, source, &self.sources));
+            let pct = self.shown(Kind::Source, source.index, source.pct);
+            card = card.block(
+                popup::column()
+                    .push(popup::split(
+                        popup::section("input", ctx),
+                        [popup::detail(format!("{pct}%"), ctx)
+                            .class(cosmic::theme::Text::Color(palette.accent()))
+                            .into()],
+                    ))
+                    .push(
+                        popup::lines()
+                            .push(popup::item(elide(&source.description, 30), ctx))
+                            .push(self.slider_row(
+                                ctx,
+                                Kind::Source,
+                                source.index,
+                                pct,
+                                source.mute,
+                                true,
+                            )),
+                    ),
+            );
+            if self.sources.len() > 1 {
+                card = card.block(switch_block(ctx, Kind::Source, source, &self.sources));
+            }
         }
 
         let live: Vec<&AppStream> = self.streams.iter().filter(|s| !s.corked).collect();
         if !live.is_empty() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(heading(ctx, "Playing"));
+            let mut list = popup::column().push(popup::section("playing", ctx));
             for stream in live {
                 let label = match &stream.title {
                     Some(title) => format!("{} · {}", stream.app, elide(title, 30)),
                     None => stream.app.clone(),
                 };
-                body = body
-                    .push(
-                        crate::theme::text(label)
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.fg())),
-                    )
-                    .push(self.slider_row(
-                        ctx,
-                        Kind::Stream,
-                        stream.index,
-                        self.shown(Kind::Stream, stream.index, stream.pct),
-                        stream.mute,
-                        stream.writable,
-                    ));
+                let meter = self.slider_row(
+                    ctx,
+                    Kind::Stream,
+                    stream.index,
+                    self.shown(Kind::Stream, stream.index, stream.pct),
+                    stream.mute,
+                    stream.writable,
+                );
+                list = list.push(popup::lines().push(popup::item(label, ctx)).push(meter));
             }
+            // How many applications are playing is the session's business, not
+            // the bar's, so this is the block that scrolls.
+            card = card.list(list);
         }
 
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
-    }
-
-    /// Header, slider, mute toggle, and the other devices you can switch to.
-    fn device_section<'a>(
-        &'a self,
-        ctx: &Ctx,
-        title: &'a str,
-        kind: Kind,
-        current: &'a Device,
-        all: &'a [Device],
-    ) -> Element<'a, Message> {
-        let palette = ctx.palette;
-        let pct = self.shown(kind, current.index, current.pct);
-        let glyph = match kind {
-            Kind::Source if current.mute => MIC_MUTED,
-            Kind::Source => MIC,
-            _ => current.form.glyph(current.mute, pct),
-        };
-
-        let mut column = widget::Column::new()
-            .spacing(4)
-            .width(Length::Fill)
-            .push(
-                widget::Row::new()
-                    .push(heading(ctx, title).width(Length::Fill))
-                    .push(
-                        crate::theme::text(format!("{pct}%"))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.accent())),
-                    )
-                    .align_y(Alignment::Center)
-                    .spacing(8),
-            )
-            .push(
-                crate::theme::text(format!("{CHECK} {glyph}  {}", elide(&current.description, 30)))
-                    .class(cosmic::theme::Text::Color(palette.fg())),
-            )
-            .push(self.slider_row(ctx, kind, current.index, pct, current.mute, true));
-
-        // The alternatives are clickable rows; say so, because a dimmed line
-        // does not look like a button until the pointer is over it.
-        if all.len() > 1 {
-            column = column.push(heading(ctx, "switch to"));
-        }
-
-        let others = all.iter().filter(|device| device.index != current.index);
-        for device in others {
-            column = column.push(
-                widget::button::custom(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(elide(&device.description, 32))
-                                .size(ctx.small())
-                                .class(cosmic::theme::Text::Color(palette.muted()))
-                                .width(Length::Fill),
-                        )
-                        .push(
-                            crate::theme::text(format!("{}%", device.pct))
-                                .size(ctx.small())
-                                .class(cosmic::theme::Text::Color(palette.overlay0)),
-                        )
-                        .align_y(Alignment::Center)
-                        .spacing(6),
-                )
-                .padding([2, 8])
-                .width(Length::Fill)
-                .class(crate::theme::module_button(palette, palette.base, [8.0; 4]))
-                .on_press(event_message(Event::SetDefault(kind, device.name.clone()))),
-            );
-        }
-
-        column.into()
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .build(),
+        )
     }
 
     fn slider_row<'a>(
@@ -514,41 +476,29 @@ impl State {
         mute: bool,
         writable: bool,
     ) -> Element<'a, Message> {
-        let palette = ctx.palette;
-        let mut row = widget::Row::new().align_y(Alignment::Center).spacing(8);
-        row = if writable {
-            row.push(
-                widget::slider(0..=MAX_PCT, pct, move |pct| {
-                    event_message(Event::SetVolume(kind, index, pct))
-                })
-                .step(1u32)
-                .width(Length::Fill),
-            )
+        let meter: Element<'a, Message> = if writable {
+            widget::slider(0..=MAX_PCT, pct, move |pct| {
+                event_message(Event::SetVolume(kind, index, pct))
+            })
+            .step(1u32)
+            .width(Length::Fill)
+            .into()
         } else {
-            row.push(
-                crate::theme::text("fixed volume")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.overlay0))
-                    .width(Length::Fill),
-            )
+            popup::detail("fixed volume", ctx).into()
         };
-        row.push(
-            widget::button::custom(
-                crate::theme::text(match (kind, mute) {
+        popup::split(
+            meter,
+            [popup::icon_chip(
+                match (kind, mute) {
                     (Kind::Source, true) => MIC_MUTED,
                     (Kind::Source, false) => MIC,
                     (_, true) => SPEAKER_MUTED,
                     (_, false) => SPEAKER[2],
-                })
-                .class(cosmic::theme::Text::Color(if mute {
-                    palette.red
-                } else {
-                    palette.fg()
-                })),
-            )
-            .padding([2, 8])
-            .class(crate::theme::module_button(palette, palette.base, [8.0; 4]))
-            .on_press(event_message(Event::ToggleMute(kind, index))),
+                },
+                Chip::Plain,
+                ctx,
+                Some(event_message(Event::ToggleMute(kind, index))),
+            )],
         )
         .into()
     }
@@ -646,10 +596,26 @@ fn stream_at(streams: &[AppStream], index: u32) -> Option<&AppStream> {
     streams.iter().find(|stream| stream.index == index)
 }
 
-fn heading<'a>(ctx: &Ctx, title: &'a str) -> widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    crate::theme::text(title)
-        .size(ctx.small())
-        .class(cosmic::theme::Text::Color(ctx.palette.muted()))
+/// The devices of one kind the bar could point at instead. They are a menu, so
+/// they are rows: a line that answers a click has to say so before the click.
+fn switch_block<'a>(
+    ctx: &Ctx,
+    kind: Kind,
+    current: &'a Device,
+    all: &'a [Device],
+) -> Element<'a, Message> {
+    let mut block = popup::column().push(popup::section("switch to", ctx));
+    for device in all.iter().filter(|device| device.index != current.index) {
+        block = block.push(popup::row(
+            popup::split(
+                popup::item(elide(&device.description, 32), ctx),
+                [popup::detail(format!("{}%", device.pct), ctx).into()],
+            ),
+            ctx.palette,
+            Some(event_message(Event::SetDefault(kind, device.name.clone()))),
+        ));
+    }
+    block.into()
 }
 
 fn elide(text: &str, limit: usize) -> String {

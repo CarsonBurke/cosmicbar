@@ -16,22 +16,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Alignment, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 use zbus::zvariant::{OwnedValue, Value};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card};
 use crate::theme::Island;
 
 /// waybar: `@battery` → surface0.
 pub const ISLAND: Island = Island::Start;
-
-/// Popup content width; see the note in `power.rs`.
-const POPUP_WIDTH: f32 = 320.0;
 
 /// waybar `format-icons`: empty through full, indexed by tens of a percent.
 const CHARGE_GLYPHS: [&str; 10] = [
@@ -302,23 +300,32 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
         let snapshot = self.snapshot.as_ref()?;
-        let mut body = widget::Column::new()
-            .spacing(8)
-            .width(Length::Fixed(POPUP_WIDTH));
-
-        body = body.push(
-            crate::theme::text(if snapshot.on_battery {
-                "on battery"
-            } else {
-                "on AC power"
-            })
-            .size(ctx.small())
+        // Which side of the wall socket the machine is on is the one thing no
+        // bar cell can say, so it is the card's title, and the battery the cell
+        // does speak for supplies the value beside it.
+        let headline: Option<Element<'_, Message>> = snapshot.headline().map(|device| {
+            popup::item(device.charge(), ctx)
+                .class(cosmic::theme::Text::Color(device.color(ctx)))
+                .into()
+        });
+        let mut card = Card::new().block(popup::split(
+            popup::title(
+                if snapshot.on_battery {
+                    "on battery"
+                } else {
+                    "on AC power"
+                },
+                ctx,
+            )
+            // Running the machine down is worth flagging; mains is the state
+            // every other reading in the card is written for.
             .class(cosmic::theme::Text::Color(if snapshot.on_battery {
                 palette.peach
             } else {
-                palette.muted()
+                palette.fg()
             })),
-        );
+            headline,
+        ));
 
         for device in snapshot
             .display
@@ -341,39 +348,36 @@ impl State {
                 detail.push(format!("updated {ago} ago"));
             }
 
-            body = body.push(
-                widget::Column::new()
+            let charge: Element<'_, Message> = popup::item(device.charge(), ctx)
+                .class(cosmic::theme::Text::Color(device.color(ctx)))
+                .into();
+            card = card.block(popup::split(
+                popup::lines()
                     .push(
+                        // The colour band belongs to the glyph and the charge:
+                        // five device names in five colours down one card is no
+                        // longer a column of names.
                         widget::Row::new()
-                            .push(crate::theme::text(device.glyph()).class(
-                                cosmic::theme::Text::Color(device.color(ctx)),
-                            ))
-                            .push(crate::theme::text(device.name()).width(Length::Fill))
-                            .push(crate::theme::text(device.charge()).class(
-                                cosmic::theme::Text::Color(device.color(ctx)),
-                            ))
-                            .spacing(8)
+                            .push(
+                                crate::theme::glyph_text(device.glyph(), ctx.body())
+                                    .class(cosmic::theme::Text::Color(device.color(ctx))),
+                            )
+                            .push(popup::item(device.name(), ctx))
+                            .spacing(crate::theme::GLYPH_GAP)
                             .align_y(Alignment::Center),
                     )
-                    .push(
-                        crate::theme::text(detail.join(" · "))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.overlay0)),
-                    )
-                    .spacing(1)
-                    .width(Length::Fill),
-            );
+                    .push(popup::detail(detail.join(" · "), ctx)),
+                [charge],
+            ));
         }
 
-        if snapshot.display.is_none() && snapshot.devices.is_empty() {
-            body = body.push(
-                crate::theme::text("UPower reports no batteries")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe(
+                (snapshot.display.is_none() && snapshot.devices.is_empty())
+                    .then(|| popup::detail("UPower reports no batteries", ctx)),
+            )
+            .build(),
+        )
     }
 
     pub fn fast_tick(&self, _open: bool) -> bool {

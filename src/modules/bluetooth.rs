@@ -18,17 +18,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt, channel::mpsc::Sender};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Alignment, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 use zbus::message::{Message as BusMessage, Type as MessageType};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::{Island, Palette};
 
 /// waybar drew `#bluetooth` on the `@tray` (mantle) background.
@@ -49,7 +50,6 @@ const ICON_BLUETOOTH: &str = "\u{f00af}";
 const ICON_ON: &str = "\u{f00b0}";
 const ICON_CONNECTED: &str = "\u{f00b1}";
 const ICON_OFF: &str = "\u{f00b2}";
-const ICON_TERMINAL: &str = "\u{f018d}";
 const ICON_HEADSET: &str = "\u{f02cb}";
 const ICON_SPEAKER: &str = "\u{f04c3}";
 const ICON_KEYBOARD: &str = "\u{f030c}";
@@ -299,67 +299,65 @@ impl State {
         let snapshot = self.snapshot.as_ref().filter(|_| self.available)?;
         let adapter = snapshot.adapter.as_ref()?;
         let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
 
-        // The popup hangs under the bluetooth glyph and the power toggle sits
-        // beside this line, so naming the adapter is all the header owes; the
-        // powered-off case says so on its own line below.
-        let title = crate::theme::text(if adapter.alias.is_empty() {
-            adapter.address.clone()
+        // The popup hangs under the bluetooth glyph, so the header owes only the
+        // adapter's name and the address that tells two of them apart.
+        let mut identity = popup::lines();
+        if adapter.alias.is_empty() {
+            // With no alias the address is the only name the adapter has, so it
+            // is the title rather than a second line repeating it.
+            identity = identity.push(popup::title(adapter.address.as_str(), ctx));
         } else {
-            adapter.alias.clone()
-        })
-        .width(Length::Fill);
-        let mut controls = widget::Row::new().align_y(Alignment::Center).spacing(6);
-        controls = controls.push(self.action(
-            palette,
+            identity = identity
+                .push(popup::title(adapter.alias.as_str(), ctx))
+                .push(popup::detail(adapter.address.as_str(), ctx));
+        }
+
+        let mut controls = vec![self.action(
+            ctx,
             if adapter.powered { "off" } else { "on" },
+            // An unpowered adapter has one thing left to offer, and the rest of
+            // this card is a single line saying so.
+            if adapter.powered {
+                Chip::Plain
+            } else {
+                Chip::Accent
+            },
             &adapter.path,
             Event::SetPowered(!adapter.powered),
-        ));
+        )];
         if adapter.powered {
-            controls = controls.push(self.action(
-                palette,
-                if adapter.discovering {
-                    "stop"
-                } else {
-                    "scan"
-                },
+            controls.push(self.action(
+                ctx,
+                if adapter.discovering { "stop" } else { "scan" },
+                Chip::Plain,
                 &adapter.path,
                 Event::SetDiscovering(!adapter.discovering),
             ));
         }
-        body = body.push(
-            widget::Row::new()
-                .push(title)
-                .push(controls)
-                .align_y(Alignment::Center)
-                .spacing(8),
-        );
+        let mut card = Card::new().block(popup::split(identity, controls));
 
         if !adapter.powered {
-            body = body.push(
-                crate::theme::text("powered off")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
+            return Some(
+                self.footer(card.block(popup::detail("powered off", ctx)), ctx)
+                    .build(),
             );
-            return Some(self.footer(ctx, body).apply(widget::container).padding(12).into());
         }
 
         let connected: Vec<&Device> = snapshot.connected().collect();
         if !connected.is_empty() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(section(ctx, "connected"));
+            let mut block = popup::column().push(popup::section("connected", ctx));
             for device in connected {
-                body = body.push(self.row(
+                block = block.push(self.row(
                     ctx,
                     device,
                     palette.green,
                     "disconnect",
+                    Chip::Danger,
                     Event::Disconnect(device.path.clone()),
                 ));
             }
+            card = card.block(block);
         }
 
         let paired: Vec<&Device> = snapshot
@@ -368,18 +366,18 @@ impl State {
             .filter(|device| device.paired && !device.connected)
             .collect();
         if !paired.is_empty() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(section(ctx, "paired"));
+            let mut block = popup::column().push(popup::section("paired", ctx));
             for device in paired {
-                body = body.push(self.row(
+                block = block.push(self.row(
                     ctx,
                     device,
                     palette.fg(),
                     "connect",
+                    Chip::Plain,
                     Event::Connect(device.path.clone()),
                 ));
             }
+            card = card.block(block);
         }
 
         let nearby: Vec<&Device> = snapshot
@@ -388,127 +386,118 @@ impl State {
             .filter(|device| !device.paired && !device.connected)
             .collect();
         if !nearby.is_empty() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(section(ctx, "nearby"));
+            let mut block = popup::column().push(popup::section("nearby", ctx));
             for device in nearby.iter().take(NEARBY_LIMIT) {
-                body = body.push(self.row(
+                block = block.push(self.row(
                     ctx,
                     device,
                     palette.muted(),
                     "pair",
+                    Chip::Plain,
                     Event::Pair(device.path.clone()),
                 ));
             }
             if nearby.len() > NEARBY_LIMIT {
-                body = body.push(
-                    crate::theme::text(format!("+{} more", nearby.len() - NEARBY_LIMIT))
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.overlay0)),
-                );
+                block = block.push(popup::detail(
+                    format!("+{} more", nearby.len() - NEARBY_LIMIT),
+                    ctx,
+                ));
             }
+            card = card.block(block);
         } else if adapter.discovering {
-            body = body.push(
-                crate::theme::text("scanning…")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
+            // Having found nothing yet is still what the section has to say.
+            card = card.block(
+                popup::column()
+                    .push(popup::section("nearby", ctx))
+                    .push(popup::detail("scanning…", ctx)),
             );
         }
 
-        Some(self.footer(ctx, body).apply(widget::container).padding(12).into())
+        Some(self.footer(card, ctx).build())
     }
 
-    /// One device row: glyph and name, its detail line, and its one action.
+    /// One device row: glyph and name, the readings that belong to them, and
+    /// the row's one action. The row itself is not clickable, because every
+    /// verb a device has is already the chip on its right.
     fn row<'a>(
         &self,
         ctx: &Ctx,
         device: &Device,
         color: cosmic::iced::Color,
         action: &'a str,
+        style: Chip,
         event: Event,
     ) -> Element<'a, Message> {
-        let palette = ctx.palette;
-        // The popup is 420px wide at most: a battery reading and an RSSI are
-        // worth that space, a MAC address the user cannot act on is not.
-        let mut details = Vec::new();
+        // The card is narrow: a battery reading and an RSSI are worth a line of
+        // it, a MAC address the user cannot act on is not.
+        let mut readings = Vec::new();
         if let Some(battery) = device.battery {
-            details.push(format!("{battery}%"));
+            readings.push(format!("{battery}%"));
         }
         if let Some(rssi) = device.rssi {
-            details.push(format!("{rssi}dBm"));
+            readings.push(format!("{rssi}dBm"));
         }
         let name = if device.name.is_empty() {
             &device.address
         } else {
             &device.name
         };
-        widget::Row::new()
-            .push(
-                crate::theme::text(format!("{} {}", device_icon(device), elide(name, ROW_LIMIT)))
-                    .class(cosmic::theme::Text::Color(color))
-                    .width(Length::Fill),
-            )
-            .push(
-                crate::theme::text(details.join(" · "))
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(match device.battery {
-                        Some(battery) if battery <= BATTERY_WARNING => {
-                            battery_color(battery, &palette)
-                        }
-                        _ => palette.overlay0,
-                    })),
-            )
-            .push(self.action(palette, action, &device.path, event))
-            .align_y(Alignment::Center)
-            .spacing(8)
-            .into()
+        let mut lines = popup::lines().push(crate::theme::label(
+            device_icon(device),
+            elide(name, ROW_LIMIT),
+            ctx.body(),
+            cosmic::theme::Text::Color(color),
+        ));
+        if !readings.is_empty() {
+            let readings = popup::detail(readings.join(" · "), ctx);
+            lines = lines.push(match device.battery {
+                // A battery low enough to matter is the one reading on this
+                // line worth a colour of its own.
+                Some(battery) if battery <= BATTERY_WARNING => readings.class(
+                    cosmic::theme::Text::Color(battery_color(battery, &ctx.palette)),
+                ),
+                _ => readings,
+            });
+        }
+        popup::split(
+            lines,
+            [self.action(ctx, action, style, &device.path, event)],
+        )
+        .into()
     }
 
-    /// A button that turns into an inert `…` while its call is in flight.
+    /// A chip that goes inert while its own call is in flight: the affordance
+    /// stays where it was instead of the row reflowing around a button that
+    /// disappeared for a moment.
     fn action<'a>(
         &self,
-        palette: Palette,
+        ctx: &Ctx,
         label: &'a str,
+        style: Chip,
         key: &str,
         event: Event,
     ) -> Element<'a, Message> {
-        if self.busy.as_deref() == Some(key) {
-            return crate::theme::text("…").into();
-        }
-        button(palette, label, event)
+        let idle = self.busy.as_deref() != Some(key);
+        popup::chip(label, style, ctx, idle.then(|| event_message(event)))
     }
 
-    /// Shared popup tail: the pairing escape hatch and the last error.
-    fn footer<'a>(
-        &'a self,
-        ctx: &Ctx,
-        body: widget::Column<'a, Message, cosmic::Theme>,
-    ) -> widget::Column<'a, Message, cosmic::Theme> {
-        let palette = ctx.palette;
-        let mut body = body.push(widget::divider::horizontal::default()).push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text("pairing that needs a PIN")
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.overlay0))
-                        .width(Length::Fill),
-                )
-                .push(button(
-                    palette,
-                    format!("{ICON_TERMINAL} bluetoothctl"),
-                    Event::Terminal(ctx.terminal.clone()),
-                ))
-                .align_y(Alignment::Center)
-                .spacing(8),
-        );
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-        body
+    /// The two blocks every version of this card ends with: the escape hatch
+    /// for a pairing the bar cannot drive, and whatever the last call failed
+    /// with. The powered-off card is this card with less between them.
+    fn footer<'a>(&'a self, card: Card<'a>, ctx: &Ctx) -> Card<'a> {
+        card.block(popup::split(
+            popup::detail("pairing that needs a PIN", ctx),
+            [popup::chip(
+                "bluetoothctl",
+                Chip::Plain,
+                ctx,
+                Some(event_message(Event::Terminal(ctx.terminal.clone()))),
+            )],
+        ))
+        .maybe(self.error.as_ref().map(|error| {
+            popup::detail(error.as_str(), ctx)
+                .class(cosmic::theme::Text::Color(ctx.palette.red))
+        }))
     }
 
     fn adapter_path(&self) -> Option<String> {
@@ -631,32 +620,12 @@ fn device_icon(device: &Device) -> &'static str {
     }
 }
 
-/// A text button whose label is drawn in the bar's font: `button::text` would
-/// hand the label to COSMIC's Open Sans and render every nerd glyph as tofu.
-fn button<'a>(
-    palette: Palette,
-    label: impl Into<std::borrow::Cow<'a, str>> + 'a,
-    event: Event,
-) -> Element<'a, Message> {
-    widget::button::custom(crate::theme::text(label))
-        .class(crate::theme::chip(palette))
-        .on_press(event_message(event))
-        .into()
-}
-
 fn elide(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
     let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
     format!("{kept}…")
-}
-
-fn section<'a>(ctx: &Ctx, label: &'a str) -> Element<'a, Message> {
-    crate::theme::text(label)
-        .size(ctx.small())
-        .class(cosmic::theme::Text::Color(ctx.palette.overlay0))
-        .into()
 }
 
 // ---------------------------------------------------------------- subscription

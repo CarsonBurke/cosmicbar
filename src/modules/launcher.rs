@@ -13,13 +13,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
+use cosmic::Element;
 use cosmic::app::Task;
-use cosmic::iced::{Alignment, Length, Subscription};
-use cosmic::widget;
-use cosmic::{Apply, Element};
+use cosmic::iced::{Alignment, Subscription};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card};
 use crate::theme::Island;
 
 /// waybar: `#custom-trigger` sits directly on the bar background.
@@ -28,9 +28,6 @@ pub const ISLAND: Island = Island::Flat;
 /// nf-linux-cachyos. Waybar's `custom/distro` used the generic Arch mark
 /// (nf-md-arch); this machine is CachyOS and the font has its actual logo.
 const ICON: &str = "\u{f385}";
-
-/// Popup content width; see the note in `power.rs`.
-const POPUP_WIDTH: f32 = 400.0;
 
 /// The session launcher: niri binds Mod+D to it, waybar's trigger clicked it.
 const LAUNCHER: &str = "walker";
@@ -101,54 +98,31 @@ impl State {
     }
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
-        let mut body = widget::Column::new()
-            .spacing(2)
-            .width(Length::Fixed(POPUP_WIDTH));
-
+        let mut menu = popup::column();
         for entry in entries(ctx) {
-            // The glyph sits against its label at the bar's own ink gap, and the
-            // command hangs off the right edge: one line per entry, whatever the
-            // label's length.
-            let row = widget::Row::new()
-                .push(crate::theme::label(
-                    entry.glyph,
-                    entry.label,
-                    ctx.font_size,
-                    cosmic::theme::Text::Color(ctx.palette.fg()),
-                ))
-                .push(widget::space::horizontal())
-                .push(
-                    crate::theme::text(entry.hint)
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(ctx.palette.muted())),
-                )
-                .spacing(10)
-                .align_y(Alignment::Center);
-            // Faded like a bar cell: `button` would snap between two greys the
-            // width of the card.
-            body = body.push(crate::fill::fill(
-                row.apply(widget::button::custom)
-                    .width(Length::Fill)
-                    .padding([6, 10])
-                    .class(crate::theme::cell(
-                        ctx.palette.fg(),
-                        crate::theme::ROW_CORNERS,
-                    ))
-                    .on_press(event_message(Event::Launch(entry.argv))),
-                crate::theme::row_fill(ctx.palette),
-                crate::theme::ROW_CORNERS,
+            menu = menu.push(popup::row(
+                popup::split(
+                    crate::theme::label(
+                        entry.glyph,
+                        entry.label,
+                        ctx.body(),
+                        cosmic::theme::Text::Color(ctx.palette.fg()),
+                    ),
+                    [popup::detail(entry.hint, ctx).into()],
+                ),
+                ctx.palette,
+                Some(event_message(Event::Launch(entry.argv))),
             ));
         }
-
-        if let Some(error) = &self.error {
-            body = body.push(widget::divider::horizontal::default()).push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(ctx.palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(10).into())
+        Some(
+            Card::new()
+                .block(menu)
+                .maybe(self.error.as_ref().map(|error| {
+                    popup::detail(error.as_str(), ctx)
+                        .class(cosmic::theme::Text::Color(ctx.palette.red))
+                }))
+                .build(),
+        )
     }
 
     pub fn fast_tick(&self, _open: bool) -> bool {

@@ -16,15 +16,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cosmic::Element;
 use cosmic::app::Task;
+use cosmic::iced::Subscription;
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
-use cosmic::iced::{Alignment, Length, Subscription};
-use cosmic::widget;
-use cosmic::{Apply, Element};
 use zbus::zvariant::Value;
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar painted `#custom-mako` `@tray`, which is `@mantle`.
@@ -40,8 +40,6 @@ const BELL_DND_WAITING: &str = "\u{f009b}";
 const BELL_DND_IDLE: &str = "\u{f0a91}";
 /// nf-md-close: dismiss one entry.
 const DISMISS: &str = "\u{f0156}";
-/// nf-md-history: the history section.
-const HISTORY: &str = "\u{f02da}";
 
 /// mako's mode for "hold everything back", the one `makoctl mode -t
 /// do-not-disturb` toggled.
@@ -57,12 +55,6 @@ const SUMMARY_LIMIT: usize = 64;
 const BODY_LIMIT: usize = 160;
 /// History entries shown; mako's own `max-history` is usually 5.
 const HISTORY_LIMIT: usize = 5;
-/// Rough rendered height of one waiting entry and one history line, used to
-/// keep the scrolled list snug around a short list.
-const WAITING_ROW: f32 = 58.0;
-const HISTORY_ROW: f32 = 20.0;
-/// Tallest the list gets before it scrolls instead of growing the popup.
-const LIST_HEIGHT: f32 = 420.0;
 
 /// Reconnect ladder for a session bus that is down or restarting.
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
@@ -233,77 +225,57 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let snapshot = self.snapshot.as_ref()?;
         let palette = ctx.palette;
-        let mut list = widget::Column::new().spacing(6).width(Length::Fill);
-
-        for notification in &snapshot.waiting {
-            list = list.push(self.entry(notification, ctx));
-        }
-
-        let history: Vec<&Notification> = snapshot.history.iter().take(HISTORY_LIMIT).collect();
-        if !history.is_empty() {
-            list = list.push(widget::divider::horizontal::default()).push(
-                widget::Row::new()
-                    .push(
-                        crate::theme::text(format!("{HISTORY} history"))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.overlay0))
-                            .width(Length::Fill),
-                    )
-                    .push(
-                        widget::button::text("restore")
-                            .class(crate::theme::chip(palette))
-                            .on_press(event_message(Event::Restore)),
-                    )
-                    .align_y(Alignment::Center)
-                    .spacing(8),
-            );
-            for notification in &history {
-                list = list.push(
-                    crate::theme::text(format!(
-                        "{} · {}",
-                        notification.app_name,
-                        elide(&notification.summary, SUMMARY_LIMIT)
-                    ))
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.overlay0)),
-                );
-            }
-        }
-
         let waiting = snapshot.waiting.len();
         let dnd = snapshot.dnd();
 
-        // The list is unbounded - a busy desktop keeps a screenful of waiting
-        // notifications - and a popup taller than the bar's own limit is never
-        // mapped at all, so scroll it. The height is estimated from the row
-        // counts rather than fixed, so three notifications do not open a
-        // half-empty panel.
-        let rows = waiting as f32 * WAITING_ROW
-            + history.len() as f32 * HISTORY_ROW
-            + if history.is_empty() { 0.0 } else { HISTORY_ROW * 2.0 };
         // The popup hangs under the bell glyph, so the header only owes the
-        // count it is listing and whether mako is holding them back. It sits
-        // outside the scrollable: an empty list is zero rows tall, and a count
-        // clipped to nothing would be the one case that needed it most.
-        let mut body = widget::Column::new()
-            .spacing(6)
-            .width(Length::Fill)
-            .push(
-                crate::theme::text(if dnd {
-                    format!("{waiting} waiting · dnd")
-                } else {
-                    format!("{waiting} waiting")
-                })
-                .class(cosmic::theme::Text::Color(if waiting == 0 || dnd {
+        // count it is listing and whether mako is holding them back.
+        let mut heading = popup::lines().push(
+            popup::title(format!("{waiting} waiting"), ctx).class(cosmic::theme::Text::Color(
+                if waiting == 0 || dnd {
                     palette.muted()
                 } else if snapshot.critical() {
                     palette.red
                 } else {
                     palette.accent()
-                })),
-            );
+                },
+            )),
+        );
+        if dnd {
+            heading = heading.push(popup::detail("· dnd", ctx));
+        }
+        let mut card = Card::new().block(popup::split(heading, []));
+
+        let history: Vec<&Notification> = snapshot.history.iter().take(HISTORY_LIMIT).collect();
         if waiting > 0 || !history.is_empty() {
-            body = body.push(widget::scrollable(list).height(Length::Fixed(rows.min(LIST_HEIGHT))));
+            let mut list = popup::column();
+            for notification in &snapshot.waiting {
+                list = list.push(self.entry(notification, ctx));
+            }
+            if !history.is_empty() {
+                list = list.push(popup::split(
+                    popup::section("history", ctx),
+                    [popup::chip(
+                        "restore",
+                        Chip::Plain,
+                        ctx,
+                        Some(event_message(Event::Restore)),
+                    )],
+                ));
+                // A dismissed notification has no actions left to offer, so
+                // its line is just enough to recognise what was restored.
+                for notification in &history {
+                    list = list.push(popup::detail(
+                        format!(
+                            "{} · {}",
+                            notification.app_name,
+                            elide(&notification.summary, SUMMARY_LIMIT)
+                        ),
+                        ctx,
+                    ));
+                }
+            }
+            card = card.list(list);
         }
 
         let modes = snapshot
@@ -313,48 +285,37 @@ impl State {
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
-        body = body.push(widget::divider::horizontal::default()).push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text(if modes.is_empty() {
-                        "mode: default".to_owned()
-                    } else {
-                        format!("mode: {modes}")
-                    })
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted()))
-                    .width(Length::Fill),
-                )
-                .push(
-                    widget::button::text(if snapshot.dnd() {
-                        "allow"
-                    } else {
-                        "do not disturb"
-                    })
-                    .class(crate::theme::chip(palette))
-                    .on_press(event_message(Event::ToggleDnd)),
-                )
-                .push(
-                    widget::button::text("dismiss all")
-                        .class(crate::theme::chip(palette))
-                        .on_press_maybe(
-                            (!snapshot.waiting.is_empty())
-                                .then(|| event_message(Event::DismissAll)),
-                        ),
-                )
-                .align_y(Alignment::Center)
-                .spacing(6),
-        );
+        card = card.block(popup::split(
+            popup::detail(
+                if modes.is_empty() {
+                    "mode: default".to_owned()
+                } else {
+                    format!("mode: {modes}")
+                },
+                ctx,
+            ),
+            [
+                popup::chip(
+                    if dnd { "allow" } else { "do not disturb" },
+                    Chip::Plain,
+                    ctx,
+                    Some(event_message(Event::ToggleDnd)),
+                ),
+                popup::chip(
+                    "dismiss all",
+                    Chip::Danger,
+                    ctx,
+                    (waiting > 0).then(|| event_message(Event::DismissAll)),
+                ),
+            ],
+        ));
 
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.as_str())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .build(),
+        )
     }
 
     /// Nothing here changes per second.
@@ -363,38 +324,32 @@ impl State {
     }
 
     /// One notification: clicking the text invokes its default action, the
-    /// button on the right dismisses it, and any further actions get a button
-    /// of their own.
+    /// glyph chip dismisses it, and any further actions get a chip of their
+    /// own.
     fn entry<'a>(&'a self, notification: &'a Notification, ctx: &Ctx) -> Element<'a, Message> {
         let palette = ctx.palette;
-        let mut details = widget::Column::new().spacing(1).width(Length::Fill);
-        details = details.push(
-            crate::theme::text(format!(
-                "{}{}",
-                notification.app_name,
-                match notification.urgency {
-                    2 => " · critical",
-                    0 => " · low",
-                    _ => "",
-                }
-            ))
-            .size(ctx.small())
+        let mut lines = popup::lines().push(
+            popup::detail(
+                format!(
+                    "{}{}",
+                    notification.app_name,
+                    match notification.urgency {
+                        2 => " · critical",
+                        0 => " · low",
+                        _ => "",
+                    }
+                ),
+                ctx,
+            )
             .class(cosmic::theme::Text::Color(match notification.urgency {
                 2 => palette.red,
                 0 => palette.overlay0,
                 _ => palette.muted(),
             })),
         );
-        details = details.push(crate::theme::text(elide(
-            &notification.summary,
-            SUMMARY_LIMIT,
-        )));
+        lines = lines.push(popup::item(elide(&notification.summary, SUMMARY_LIMIT), ctx));
         if !notification.body.is_empty() {
-            details = details.push(
-                crate::theme::text(elide(&notification.body, BODY_LIMIT))
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
+            lines = lines.push(popup::detail(elide(&notification.body, BODY_LIMIT), ctx));
         }
 
         let default_action = notification
@@ -402,49 +357,44 @@ impl State {
             .iter()
             .find(|(key, _)| key == "default")
             .map(|(key, _)| key.clone());
-        let details: Element<'a, Message> = match default_action {
-            // A notification with a default action is one big click target, so
-            // it fades like every other row the bar offers.
-            Some(action) => crate::fill::fill(
-                widget::button::custom(details)
-                    .padding([2.0, 4.0])
-                    .width(Length::Fill)
-                    .class(crate::theme::cell(palette.fg(), crate::theme::ROW_CORNERS))
-                    .on_press(event_message(Event::Invoke {
-                        id: notification.id,
-                        action,
-                    })),
-                crate::theme::row_fill(palette),
-                crate::theme::ROW_CORNERS,
+        // Only a notification that has somewhere to go is a click target; one
+        // without a default action is text that happens to have chips beside
+        // it, and lighting it up would promise an action it cannot perform.
+        let content: Element<'a, Message> = match default_action {
+            Some(action) => popup::row(
+                lines,
+                palette,
+                Some(event_message(Event::Invoke {
+                    id: notification.id,
+                    action,
+                })),
             ),
-            None => details.into(),
+            None => lines.into(),
         };
 
-        let mut row = widget::Row::new()
-            .push(details)
-            .align_y(Alignment::Center)
-            .spacing(6);
-        for (key, label) in &notification.actions {
-            if key == "default" {
-                continue;
-            }
-            row = row.push(
-                widget::button::text(label.clone())
-                    .class(crate::theme::chip(palette))
-                    .on_press(event_message(Event::Invoke {
-                    id: notification.id,
-                    action: key.clone(),
-                })),
-            );
-        }
-        row.push(
-            // A glyph button, so it needs the bar's nerd font rather than the
-            // Open Sans `button::text` would pick.
-            widget::button::custom(crate::theme::text(DISMISS))
-                .padding([2.0, 8.0])
-                .on_press(event_message(Event::Dismiss(notification.id))),
-        )
-        .into()
+        let mut actions: Vec<Element<'a, Message>> = notification
+            .actions
+            .iter()
+            .filter(|(key, _)| key != "default")
+            .map(|(key, label)| {
+                popup::chip(
+                    label.as_str(),
+                    Chip::Plain,
+                    ctx,
+                    Some(event_message(Event::Invoke {
+                        id: notification.id,
+                        action: key.clone(),
+                    })),
+                )
+            })
+            .collect();
+        actions.push(popup::icon_chip(
+            DISMISS,
+            Chip::Danger,
+            ctx,
+            Some(event_message(Event::Dismiss(notification.id))),
+        ));
+        popup::split(content, actions).into()
     }
 
     /// The mode list mako should end up with when do-not-disturb is toggled.

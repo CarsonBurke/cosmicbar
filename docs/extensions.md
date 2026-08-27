@@ -55,9 +55,9 @@ one:
 
 ```json
 {"cell": {"glyph": "󰁹", "text": "3 running", "color": "green"},
- "popup": [{"text": {"text": "queue", "color": "muted", "small": true}},
-           "divider",
-           {"row": {"lines": [{"text": "#12 sweep"}, {"text": "running · 4m", "small": true}],
+ "header": {"lines": [{"text": "3 running"}, {"text": "3/4 leases", "color": "muted", "small": true}],
+            "action": {"id": "pause", "label": "pause"}},
+ "popup": [{"row": {"lines": [{"text": "#12 sweep"}, {"text": "running · 4m", "small": true}],
                     "action": {"id": "cancel:12", "label": "cancel", "danger": true}}}]}
 ```
 
@@ -67,7 +67,14 @@ one:
 | `cell.glyph` | string | Nerd Font glyph, drawn at icon size before the text. |
 | `cell.text` | string | May be empty for an icon-only cell. |
 | `cell.color` | role | Colours glyph and text alike. |
-| `popup` | array | Empty (or absent) means the cell is not clickable. |
+| `header` | row or `null` | The popup's header, pinned above the list. Its first line is the card's title. |
+| `popup` | array | The list under the header. Empty (or absent) means the cell is not clickable unless a `header` is sent. |
+
+The popup is a card: the `header` stays on screen and the `popup` list scrolls
+under it. Put what the popup *is* and the verb that acts on all of it in the
+header — a queue and its pause, a device and its switch — and one row per thing
+in the list. A header line is drawn at the popup's title size unless it sets
+`small`, so `lines` reads as a title with its state under it.
 
 Unknown fields are rejected, not ignored: a frame with a typo in a key is a
 malformed frame.

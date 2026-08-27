@@ -68,9 +68,19 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Secondary text size, for popup detail lines.
+    /// Popup type scale. Three steps from the bar's own size, so a card reads
+    /// as a hierarchy rather than as one size in several colours: the title of
+    /// a popup is as big as the cell it hangs from, a row's own name is a step
+    /// down from it, and the detail under that name is a step down again.
+    ///
+    /// A row's own text: the name of the thing the row is about.
+    pub fn body(&self) -> f32 {
+        (self.font_size - 2.0).max(10.0)
+    }
+
+    /// Secondary text: the detail under a name, a section label, a chip.
     pub fn small(&self) -> f32 {
-        (self.font_size - 3.0).max(9.0)
+        (self.font_size - 4.0).max(9.0)
     }
 }
 
@@ -143,6 +153,16 @@ macro_rules! modules {
             /// Every built-in module. Extensions are named by the config, so
             /// they are not enumerable here.
             pub const ALL: &'static [Self] = &[$(Self::$variant),*];
+
+            /// Position of a built-in module in [`ModuleId::ALL`], so a set of
+            /// them fits in a bitmask. `None` for an extension: extensions are
+            /// named by the config, so there is no fixed set to index into.
+            pub fn bit(self) -> Option<u32> {
+                match self {
+                    Self::Extension(_) => None,
+                    id => Self::ALL.iter().position(|other| *other == id).map(|at| at as u32),
+                }
+            }
 
             /// The name used in config files and control commands. Borrowed for
             /// every built-in module; an extension's name lives in the name

@@ -89,26 +89,30 @@ impl std::fmt::Debug for Host {
     }
 }
 
+/// Addresses travel as `Arc<str>`. `view` builds three messages per item on
+/// every frame, and the bar redraws on every message it handles, so an owned
+/// bus name here is an allocation per item per frame for a string that is set
+/// once when the item registers and never edited afterwards.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The host came up.
     Connected(Host),
     Disconnected,
-    Added(String, Box<StatusNotifierItem>),
-    Updated(String, UpdateEvent),
-    Removed(String),
+    Added(Arc<str>, Box<StatusNotifierItem>),
+    Updated(Arc<str>, UpdateEvent),
+    Removed(Arc<str>),
     /// Left click: the item's default activation.
-    Activate(String),
+    Activate(Arc<str>),
     /// Middle click: the item's secondary activation.
-    Secondary(String),
+    Secondary(Arc<str>),
     /// Right click: show this item's menu in the popup.
-    OpenMenu(String),
+    OpenMenu(Arc<str>),
     /// Popup selector: switch which item's menu is shown.
-    Select(String),
+    Select(Arc<str>),
     /// Popup: expand or collapse a submenu.
     ToggleSubmenu(i32),
     /// Popup: a menu entry was clicked.
-    MenuClick { address: String, id: i32 },
+    MenuClick { address: Arc<str>, id: i32 },
     /// Result of a request, so a failure is visible instead of silent.
     Requested(Result<(), String>),
 }
@@ -119,7 +123,7 @@ pub enum Event {
 #[derive(Debug)]
 struct Item {
     /// Unique bus name the item lives on; also its identity here.
-    address: String,
+    address: Arc<str>,
     id: String,
     title: Option<String>,
     status: Status,
@@ -132,7 +136,7 @@ struct Item {
     theme_path: Option<String>,
     tooltip: Option<String>,
     item_is_menu: bool,
-    menu_path: Option<String>,
+    menu_path: Option<Arc<str>>,
     menu: Option<TrayMenu>,
     handle: Option<icon::Handle>,
     overlay: Option<icon::Handle>,
@@ -145,7 +149,7 @@ pub struct State {
     /// Items in the order they registered, which is the order waybar used.
     items: Vec<Item>,
     /// Address of the item whose menu the popup shows.
-    selected: Option<String>,
+    selected: Option<Arc<str>>,
     /// Submenu ids the popup has expanded.
     expanded: HashSet<i32>,
     error: Option<String>,
@@ -524,7 +528,7 @@ impl State {
             }
             if let Some(mark) = toggle_mark(entry) {
                 row = row.push(
-                    crate::theme::text(mark).class(cosmic::theme::Text::Color(color)),
+                    crate::theme::icon_text(mark).class(cosmic::theme::Text::Color(color)),
                 );
             }
             row = row.push(
@@ -541,7 +545,7 @@ impl State {
             }
             if has_submenu {
                 row = row.push(
-                    crate::theme::text(if expanded { SUBMENU_OPEN } else { SUBMENU_CLOSED })
+                    crate::theme::icon_text(if expanded { SUBMENU_OPEN } else { SUBMENU_CLOSED })
                         .class(cosmic::theme::Text::Color(color)),
                 );
             }
@@ -768,7 +772,7 @@ impl Item {
                 .size(size)
                 .opacity(if passive { 0.45 } else { 1.0 })
                 .into(),
-            None => crate::theme::text(UNKNOWN_ICON)
+            None => crate::theme::icon_text(UNKNOWN_ICON)
                 .class(cosmic::theme::Text::Color(if passive {
                     ctx.palette.overlay0
                 } else {
@@ -784,7 +788,7 @@ impl Item {
                     .into(),
             ),
             (None, Status::NeedsAttention) => Some(
-                crate::theme::text(ATTENTION_BADGE)
+                crate::theme::icon_text(ATTENTION_BADGE)
                     .size(ctx.small())
                     .class(cosmic::theme::Text::Color(ctx.palette.red))
                     .into(),

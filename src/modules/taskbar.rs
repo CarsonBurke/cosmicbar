@@ -332,7 +332,7 @@ impl State {
                     .push(self.icon(window, icon_size))
                     .push(lines)
                     .push_maybe(window.is_urgent.then(|| {
-                        crate::theme::text(URGENT_ICON)
+                        crate::theme::icon_text(URGENT_ICON)
                             .size(ctx.font_size)
                             .class(cosmic::theme::Text::Color(palette.red))
                     }))
@@ -361,7 +361,7 @@ impl State {
                     widget::Row::new()
                         .push(entry)
                         .push(
-                            crate::theme::text(CLOSE_ICON)
+                            crate::theme::icon_text(CLOSE_ICON)
                                 .size(ctx.font_size)
                                 .apply(widget::button::custom)
                                 .padding([3.0, 7.0])

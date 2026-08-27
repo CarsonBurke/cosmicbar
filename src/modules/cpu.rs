@@ -30,6 +30,7 @@ use cosmic::{Apply, Element};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card};
 use crate::theme::{Island, Palette};
 
 /// waybar: `#temperature`/`#custom-cpu_usage` sit on `@temperature` = mantle.
@@ -70,6 +71,14 @@ const CORE_METER_HEIGHT: f32 = 5.0;
 const CORE_COLUMNS: usize = 2;
 /// Processes listed in the popup.
 const TOP_PROCESSES: usize = 5;
+/// The model name is elided rather than allowed to grow, because the total
+/// usage sits beside it in the header and a marketing name long enough to push
+/// that number off the card would hide the one reading the popup is about.
+const MODEL_LIMIT: usize = 32;
+/// Width of the label column in every detail row. Fixed rather than
+/// shrink-to-fit: it is what puts the load, clock and temperature values in one
+/// column instead of at three different indents.
+const LABEL_WIDTH: f32 = 76.0;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -246,115 +255,99 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let sample = self.sample.as_ref()?;
         let palette = &ctx.palette;
-        let small = ctx.small();
         let (_, usage_color) = usage_state(sample.total, palette);
-
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
 
         let model = sample
             .detail
             .as_ref()
             .map(|detail| &*detail.model)
             .unwrap_or("cpu");
-        body = body.push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text(model)
-                        .size(small)
-                        .class(cosmic::theme::Text::Color(palette.muted()))
-                        .width(Length::Fill),
-                )
-                .push(
-                    crate::theme::text(format!("{:.0}%", sample.total))
-                        .class(cosmic::theme::Text::Color(usage_color)),
-                )
-                .align_y(Alignment::Center)
-                .spacing(8),
+        let mut card = Card::new().block(
+            popup::column()
+                .push(popup::split(
+                    popup::title(elide(model, MODEL_LIMIT), ctx),
+                    [popup::title(format!("{:.0}%", sample.total), ctx)
+                        .class(cosmic::theme::Text::Color(usage_color))
+                        .into()],
+                ))
+                .push(meter(sample.total / 100.0, palette, METER_HEIGHT)),
         );
-        body = body.push(meter(sample.total / 100.0, palette, METER_HEIGHT));
 
         if !sample.cores.is_empty() {
-            body = body.push(widget::divider::horizontal::default());
-            body = body.push(core_grid(&sample.cores, palette, small));
+            card = card.block(
+                popup::column()
+                    .push(popup::section("cores", ctx))
+                    .push(core_grid(&sample.cores, ctx)),
+            );
         }
-
-        body = body.push(widget::divider::horizontal::default());
 
         // Present from the first detailed poll, a quarter second after the
         // popup opens.
         if let Some(detail) = &sample.detail {
-            let load = format!(
-                "{:.2} {:.2} {:.2}   {} runnable",
-                detail.load[0], detail.load[1], detail.load[2], detail.entities
-            );
-            body = body.push(field(ICON_LOAD, load, palette, small));
+            let mut block = popup::column()
+                .push(popup::section("activity", ctx))
+                .push(field(
+                    ICON_LOAD,
+                    "load",
+                    format!(
+                        "{:.2} {:.2} {:.2}   {} runnable",
+                        detail.load[0], detail.load[1], detail.load[2], detail.entities
+                    ),
+                    palette.muted(),
+                    ctx,
+                ));
             if detail.mhz_max > 0.0 {
-                body = body.push(field(
+                block = block.push(field(
                     ICON_CLOCK,
+                    "clock",
                     format!(
                         "{:.2} GHz avg   {:.2} GHz peak",
                         detail.mhz_avg / 1000.0,
                         detail.mhz_max / 1000.0
                     ),
-                    palette,
-                    small,
+                    palette.muted(),
+                    ctx,
                 ));
             }
+            card = card.block(block);
         }
-        for (label, value) in &sample.temps {
-            let (icon, color) = temp_state(*value, palette);
-            body = body.push(
-                widget::Row::new()
-                    .push(
-                        crate::theme::text(icon)
-                            .size(small)
-                            .class(cosmic::theme::Text::Color(color)),
-                    )
-                    .push(
-                        crate::theme::text(label.as_str())
-                            .size(small)
-                            .class(cosmic::theme::Text::Color(palette.muted()))
-                            .width(Length::Fill),
-                    )
-                    .push(
-                        crate::theme::text(format!("{value:.1}°C"))
-                            .size(small)
-                            .class(cosmic::theme::Text::Color(color)),
-                    )
-                    .align_y(Alignment::Center)
-                    .spacing(8),
-            );
+
+        if !sample.temps.is_empty() {
+            let mut block = popup::column().push(popup::section("temperatures", ctx));
+            for (label, value) in &sample.temps {
+                let (icon, color) = temp_state(*value, palette);
+                block = block.push(field(
+                    icon,
+                    label.as_str(),
+                    format!("{value:.1}°C"),
+                    color,
+                    ctx,
+                ));
+            }
+            card = card.block(block);
         }
 
         if let Some(detail) = &sample.detail
             && !detail.top.is_empty()
         {
-            body = body.push(widget::divider::horizontal::default());
+            let mut block = popup::column().push(popup::section("processes", ctx));
             for process in &detail.top {
-                body = body.push(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(process.name.as_str())
-                                .size(small)
-                                .width(Length::Fill),
-                        )
-                        .push(
-                            crate::theme::text(format!("{}", process.pid))
-                                .size(small)
-                                .class(cosmic::theme::Text::Color(palette.overlay0)),
-                        )
-                        .push(
-                            crate::theme::text(format!("{:>5.1}%", process.share))
-                                .size(small)
-                                .class(cosmic::theme::Text::Color(palette.blue)),
-                        )
-                        .align_y(Alignment::Center)
-                        .spacing(8),
-                );
+                block = block.push(popup::split(
+                    popup::item(process.name.as_str(), ctx),
+                    [
+                        popup::detail(format!("{}", process.pid), ctx)
+                            .class(cosmic::theme::Text::Color(palette.overlay0))
+                            .into(),
+                        popup::detail(format!("{:>5.1}%", process.share), ctx)
+                            .class(cosmic::theme::Text::Color(palette.blue))
+                            .into(),
+                    ],
+                ));
             }
+            card = card.block(block);
         }
 
-        Some(body.apply(widget::container).padding(12).into())
+        Some(card.build())
     }
 }
 
@@ -457,34 +450,30 @@ fn segment<'a>(color: Color, width: Length, height: f32) -> Element<'a, Message>
 
 /// 24 threads in two columns: one row per thread would be taller than the
 /// popup, and a single wide row per thread wastes the width.
-fn core_grid<'a>(cores: &[f32], palette: &Palette, size: f32) -> Element<'a, Message> {
+fn core_grid<'a>(cores: &[f32], ctx: &Ctx) -> Element<'a, Message> {
     // `chunks(0)` panics, and a `/proc/stat` with only the aggregate line
     // leaves this empty.
     let per_column = cores.len().div_ceil(CORE_COLUMNS).max(1);
-    let mut columns = widget::Row::new().spacing(12).width(Length::Fill);
+    let mut columns = widget::Row::new()
+        .spacing(popup::ROW_GAP)
+        .width(Length::Fill);
     for (index, chunk) in cores.chunks(per_column).enumerate() {
         let start = index * per_column;
-        let mut column = widget::Column::new().spacing(3).width(Length::FillPortion(1));
+        // The threads of one column are the lines of a single reading rather
+        // than a list of separate items, so they sit at the tighter gap.
+        let mut column = popup::lines().width(Length::FillPortion(1));
         for (offset, &value) in chunk.iter().enumerate() {
             column = column.push(
                 widget::Row::new()
+                    .push(popup::section(format!("{:>2}", start + offset), ctx))
                     .push(
-                        crate::theme::text(format!("{:>2}", start + offset))
-                            .size(size)
-                            .class(cosmic::theme::Text::Color(palette.overlay0)),
-                    )
-                    .push(
-                        meter(value / 100.0, palette, CORE_METER_HEIGHT)
+                        meter(value / 100.0, &ctx.palette, CORE_METER_HEIGHT)
                             .apply(widget::container)
                             .width(Length::Fill),
                     )
-                    .push(
-                        crate::theme::text(format!("{value:>3.0}"))
-                            .size(size)
-                            .class(cosmic::theme::Text::Color(palette.muted())),
-                    )
+                    .push(popup::detail(format!("{value:>3.0}"), ctx))
                     .align_y(Alignment::Center)
-                    .spacing(6),
+                    .spacing(popup::GAP),
             );
         }
         columns = columns.push(column);
@@ -492,24 +481,39 @@ fn core_grid<'a>(cores: &[f32], palette: &Palette, size: f32) -> Element<'a, Mes
     columns.into()
 }
 
-
-/// A muted-icon detail line for the popup.
-fn field<'a>(icon: &'a str, value: String, palette: &Palette, size: f32) -> Element<'a, Message> {
+/// One detail row: its glyph, its label in the column every other label in the
+/// card shares, and its value. The glyph takes the value's colour because what
+/// it reports is the state of that reading.
+fn field<'a>(
+    icon: &'a str,
+    label: &'a str,
+    value: String,
+    color: Color,
+    ctx: &Ctx,
+) -> Element<'a, Message> {
     widget::Row::new()
         .push(
-            crate::theme::text(icon)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.overlay0)),
+            crate::theme::icon_text(icon)
+                .size(ctx.small())
+                .class(cosmic::theme::Text::Color(color)),
         )
+        .push(popup::section(label, ctx).width(Length::Fixed(LABEL_WIDTH)))
         .push(
-            crate::theme::text(value)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.muted()))
+            popup::detail(value, ctx)
+                .class(cosmic::theme::Text::Color(color))
                 .width(Length::Fill),
         )
         .align_y(Alignment::Center)
-        .spacing(8)
+        .spacing(popup::ROW_GAP)
         .into()
+}
+
+fn elide(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// Jiffy counters for one `/proc/stat` cpu line.

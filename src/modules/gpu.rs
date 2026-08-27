@@ -33,6 +33,7 @@ use nvml_wrapper::error::NvmlError;
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card};
 use crate::theme::{Island, Palette};
 
 /// waybar: `#custom-gpu_temp`/`#custom-gpu_usage` sit on `@memory` = base.
@@ -70,6 +71,14 @@ const TEMP_CRITICAL: u32 = 90;
 const TEMP_WARNING_MARGIN: u32 = 10;
 const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+/// The device name is elided rather than allowed to grow, because the
+/// temperature sits beside it in the header and a name long enough to push that
+/// reading off the card would hide what the popup is really reporting.
+const NAME_LIMIT: usize = 26;
+/// Width of the label column in every detail row. Fixed rather than
+/// shrink-to-fit: it is what puts the gauge, clock and fan values in one column
+/// instead of at a different indent per label.
+const LABEL_WIDTH: f32 = 76.0;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -356,166 +365,160 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let sample = self.sample.as_ref()?;
         let palette = &ctx.palette;
-        let small = ctx.small();
         let (_, temp_color) = temp_state(sample.temp_c, sample.device.slowdown_c, palette);
-
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
-
-        body = body.push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text(&*sample.device.name)
-                        .size(small)
-                        .class(cosmic::theme::Text::Color(palette.muted()))
-                        .width(Length::Fill),
-                )
-                .push(
-                    crate::theme::text(match sample.device.slowdown_c {
-                        Some(limit) => format!("{}°C / {limit}°C", sample.temp_c),
-                        None => format!("{}°C", sample.temp_c),
-                    })
-                    .class(cosmic::theme::Text::Color(temp_color)),
-                )
-                .align_y(Alignment::Center)
-                .spacing(8),
-        );
-
-        body = body.push(row(
-            ICON,
-            "utilization",
-            format!("{}%", sample.gpu_percent),
-            palette.green,
-            palette,
-            small,
-        ));
-        body = body.push(bar(
-            sample.gpu_percent as f32 / 100.0,
-            palette.green,
-            palette,
-            METER_HEIGHT,
-        ));
-
-        body = body.push(row(
-            ICON_VRAM,
-            "vram",
-            format!(
-                "{:.1} / {:.1} GiB",
-                sample.vram_used as f64 / BYTES_PER_GIB,
-                sample.vram_total as f64 / BYTES_PER_GIB
-            ),
-            palette.mauve,
-            palette,
-            small,
-        ));
-        body = body.push(bar(
-            fraction(sample.vram_used, sample.vram_total),
-            palette.mauve,
-            palette,
-            METER_HEIGHT,
-        ));
-
         // Present from the first detailed poll, two seconds after the popup
         // opens at worst.
-        if let Some(detail) = &sample.detail {
+        let detail = sample.detail.as_ref();
+
+        let mut usage = popup::column()
+            .push(popup::section("usage", ctx))
+            .push(row(
+                ICON,
+                "utilization",
+                format!("{}%", sample.gpu_percent),
+                palette.green,
+                ctx,
+            ))
+            .push(bar(
+                sample.gpu_percent as f32 / 100.0,
+                palette.green,
+                palette,
+                METER_HEIGHT,
+            ))
+            .push(row(
+                ICON_VRAM,
+                "vram",
+                format!(
+                    "{:.1} / {:.1} GiB",
+                    sample.vram_used as f64 / BYTES_PER_GIB,
+                    sample.vram_total as f64 / BYTES_PER_GIB
+                ),
+                palette.mauve,
+                ctx,
+            ))
+            .push(bar(
+                fraction(sample.vram_used, sample.vram_total),
+                palette.mauve,
+                palette,
+                METER_HEIGHT,
+            ));
+        if let Some(detail) = detail {
             if let (Some(power), Some(limit)) = (detail.power_w, detail.power_limit_w) {
-                body = body.push(row(
-                    ICON_POWER,
-                    "power",
-                    format!("{power:.0} / {limit:.0} W"),
-                    palette.peach,
-                    palette,
-                    small,
-                ));
-                body = body.push(bar(power / limit, palette.peach, palette, METER_HEIGHT));
+                usage = usage
+                    .push(row(
+                        ICON_POWER,
+                        "power",
+                        format!("{power:.0} / {limit:.0} W"),
+                        palette.peach,
+                        ctx,
+                    ))
+                    .push(bar(power / limit, palette.peach, palette, METER_HEIGHT));
             } else if let Some(power) = detail.power_w {
-                body = body.push(row(
+                usage = usage.push(row(
                     ICON_POWER,
                     "power",
                     format!("{power:.0} W"),
                     palette.peach,
-                    palette,
-                    small,
+                    ctx,
                 ));
             }
-
-            body = body.push(widget::divider::horizontal::default());
-            if let Some(mhz) = detail.sm_mhz {
-                body = body.push(row(
-                    ICON_CLOCK,
-                    "sm clock",
-                    clock(mhz, detail.sm_max_mhz),
-                    palette.blue,
-                    palette,
-                    small,
-                ));
-            }
-            if let Some(mhz) = detail.mem_mhz {
-                body = body.push(row(
-                    ICON_CLOCK,
-                    "mem clock",
-                    clock(mhz, detail.mem_max_mhz),
-                    palette.blue,
-                    palette,
-                    small,
-                ));
-            }
-            body = body.push(row(
+            // How busy the memory interface was is another share of the card
+            // being used up, so it belongs with the gauges rather than with the
+            // clocks it used to sit under.
+            usage = usage.push(row(
                 ICON_BUS,
                 "memory bus",
                 format!("{}%", detail.memory_percent),
                 palette.teal,
-                palette,
-                small,
+                ctx,
             ));
-            if let Some(fan) = detail.fan_percent {
-                body = body.push(row(
-                    ICON_FAN,
-                    "fan",
-                    format!("{fan}%"),
-                    if fan == 0 { palette.muted() } else { palette.teal },
-                    palette,
-                    small,
-                ));
+        }
+
+        let mut card = Card::new()
+            .block(popup::split(
+                popup::title(elide(&sample.device.name, NAME_LIMIT), ctx),
+                [popup::title(
+                    match sample.device.slowdown_c {
+                        Some(limit) => format!("{}°C / {limit}°C", sample.temp_c),
+                        None => format!("{}°C", sample.temp_c),
+                    },
+                    ctx,
+                )
+                .class(cosmic::theme::Text::Color(temp_color))
+                .into()],
+            ))
+            .block(usage);
+
+        if let Some(detail) = detail {
+            if detail.sm_mhz.is_some() || detail.mem_mhz.is_some() {
+                let mut clocks = popup::column().push(popup::section("clocks", ctx));
+                if let Some(mhz) = detail.sm_mhz {
+                    clocks = clocks.push(row(
+                        ICON_CLOCK,
+                        "sm clock",
+                        clock(mhz, detail.sm_max_mhz),
+                        palette.blue,
+                        ctx,
+                    ));
+                }
+                if let Some(mhz) = detail.mem_mhz {
+                    clocks = clocks.push(row(
+                        ICON_CLOCK,
+                        "mem clock",
+                        clock(mhz, detail.mem_max_mhz),
+                        palette.blue,
+                        ctx,
+                    ));
+                }
+                card = card.block(clocks);
             }
 
-            body = body.push(widget::divider::horizontal::default());
+            if let Some(fan) = detail.fan_percent {
+                card = card.block(
+                    popup::column()
+                        .push(popup::section("cooling", ctx))
+                        .push(row(
+                            ICON_FAN,
+                            "fan",
+                            format!("{fan}%"),
+                            if fan == 0 { palette.muted() } else { palette.teal },
+                            ctx,
+                        )),
+                );
+            }
+
+            let mut processes = popup::column().push(popup::section("processes", ctx));
             if detail.processes.is_empty() {
-                body = body.push(
-                    crate::theme::text("no processes holding vram")
-                        .size(small)
+                processes = processes.push(
+                    popup::detail("no processes holding vram", ctx)
                         .class(cosmic::theme::Text::Color(palette.overlay0)),
                 );
             }
             for process in &detail.processes {
-                body = body.push(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(process.name.as_str())
-                                .size(small)
-                                .width(Length::Fill),
-                        )
-                        .push(
-                            crate::theme::text(format!("{}", process.pid))
-                                .size(small)
-                                .class(cosmic::theme::Text::Color(palette.overlay0)),
-                        )
-                        .push(
-                            crate::theme::text(match process.vram_bytes {
+                processes = processes.push(popup::split(
+                    popup::item(process.name.as_str(), ctx),
+                    [
+                        popup::detail(format!("{}", process.pid), ctx)
+                            .class(cosmic::theme::Text::Color(palette.overlay0))
+                            .into(),
+                        popup::detail(
+                            match process.vram_bytes {
                                 Some(bytes) => {
                                     format!("{:>5.0} MiB", bytes as f64 / BYTES_PER_MIB)
                                 }
                                 None => "—".to_string(),
-                            })
-                            .size(small)
-                            .class(cosmic::theme::Text::Color(palette.mauve)),
+                            },
+                            ctx,
                         )
-                        .align_y(Alignment::Center)
-                        .spacing(8),
-                );
+                        .class(cosmic::theme::Text::Color(palette.mauve))
+                        .into(),
+                    ],
+                ));
             }
+            card = card.block(processes);
         }
 
-        Some(body.apply(widget::container).padding(12).into())
+        Some(card.build())
     }
 }
 
@@ -551,35 +554,40 @@ fn fraction(used: u64, total: u64) -> f32 {
     used as f32 / total as f32
 }
 
-/// A labelled popup row: icon, name, value.
+/// One detail row: its glyph, its label in the column every other label in the
+/// card shares, and its value. The glyph takes the value's colour because it is
+/// the same reading in another form — the gauge under the row is that colour
+/// too.
 fn row<'a>(
     icon: &'a str,
     label: &'a str,
     value: String,
     value_color: Color,
-    palette: &Palette,
-    size: f32,
+    ctx: &Ctx,
 ) -> Element<'a, Message> {
     widget::Row::new()
         .push(
-            crate::theme::text(icon)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.overlay0)),
-        )
-        .push(
-            crate::theme::text(label)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.muted()))
-                .width(Length::Fill),
-        )
-        .push(
-            crate::theme::text(value)
-                .size(size)
+            crate::theme::icon_text(icon)
+                .size(ctx.small())
                 .class(cosmic::theme::Text::Color(value_color)),
         )
+        .push(popup::section(label, ctx).width(Length::Fixed(LABEL_WIDTH)))
+        .push(
+            popup::detail(value, ctx)
+                .class(cosmic::theme::Text::Color(value_color))
+                .width(Length::Fill),
+        )
         .align_y(Alignment::Center)
-        .spacing(8)
+        .spacing(popup::ROW_GAP)
         .into()
+}
+
+fn elide(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// A filled bar built from two rounded rectangles; `progress_bar::linear` has

@@ -190,6 +190,7 @@ impl cosmic::Application for Bar {
             Message::Module(event) => self.modules.update(event),
             Message::Tick => {
                 self.now = jiff::Zoned::now();
+                self.modules.date.sync_today(self.now.date());
                 Task::none()
             }
             // Nothing to change: the point is the frame this message causes.
@@ -708,8 +709,13 @@ impl Bar {
             // frame later. A single-child `Row` inside the tracker keeps that
             // node genuinely stateless: reuse then only re-diffs the child,
             // where the real tags are compared and a mismatch rebuilds.
-            let cell: Element<'a, Message> = match &self.tracker {
-                Some(tracker) => tracker
+            //
+            // Only a cell that can open a popup is tracked: the rectangle is
+            // read in exactly one place, to anchor that popup, and the tracker
+            // sends the rect of every cell it wraps down a channel on every
+            // single draw.
+            let cell: Element<'a, Message> = match (&self.tracker, clickable) {
+                (Some(tracker), true) => tracker
                     .container(
                         (surface, id),
                         widget::Row::new()
@@ -718,7 +724,7 @@ impl Bar {
                             .align_y(Alignment::Center),
                     )
                     .into(),
-                None => cell,
+                _ => cell,
             };
             inner = inner.push(cell);
             if index != last {
@@ -742,12 +748,14 @@ impl Bar {
 }
 
 /// Wall clock for a `Ctx::now_ms` timestamp.
+///
+/// A timestamp is absolute, so it converts straight into the system zone: going
+/// through a named zone first costs a tz-database lookup and a second zone
+/// construction for a value that is thrown away.
 pub fn local(now_ms: i64) -> jiff::Zoned {
     jiff::Timestamp::from_millisecond(now_ms)
         .unwrap_or_else(|_| jiff::Timestamp::now())
-        .in_tz("UTC")
-        .map(|zoned| zoned.with_time_zone(jiff::tz::TimeZone::system()))
-        .unwrap_or_else(|_| jiff::Zoned::now())
+        .to_zoned(jiff::tz::TimeZone::system())
 }
 
 /// The bar's own clock, aligned to the boundary it renders: every module that

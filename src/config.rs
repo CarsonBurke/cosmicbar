@@ -41,7 +41,7 @@ pub struct Config {
     pub height: u32,
     /// Base text size in logical pixels.
     pub font_size: f32,
-    /// The waybar setup used a bold nerd font; keep that by default.
+    /// Use bold weight for system text and Nerd Font icons.
     pub font_weight_bold: bool,
     /// Palette name: `catppuccin-mocha` or `catppuccin-latte`.
     pub palette: String,
@@ -61,6 +61,15 @@ pub struct Config {
     /// Modules drawn by other processes. A region places one by name, as
     /// `extension:<name>`; see `docs/extensions.md`.
     pub extensions: Vec<Extension>,
+    /// Which built-in modules the three regions place, one bit per
+    /// [`ModuleId::bit`]. Derived, never read from the file: iced recomputes
+    /// every subscription after every message the bar handles, and answering
+    /// [`Config::wants`] for each of nineteen modules — twice over, once for
+    /// the subscription list and once for the fast clock — by scanning three
+    /// placement lists is a few hundred comparisons per frame to learn
+    /// something that only changes when the file does.
+    #[serde(skip)]
+    placed: u64,
 }
 
 /// One `[[extensions]]` entry: a program the bar keeps running, which draws its
@@ -136,7 +145,9 @@ impl Default for Config {
             // Nothing by default: an extension is another program, and the
             // shipped bar spawns none.
             extensions: Vec::new(),
+            placed: 0,
         }
+        .indexed()
     }
 }
 
@@ -156,7 +167,7 @@ impl Config {
             Ok(text) => match toml::from_str(&text) {
                 Ok(config) => {
                     log::info!("loaded {}", path.display());
-                    config
+                    Self::indexed(config)
                 }
                 Err(error) => {
                     log::error!("{}: {error}; using defaults", path.display());
@@ -345,8 +356,36 @@ impl Config {
             .copied()
     }
 
+    /// The placed built-in modules, as a bitmask. Both callers of this are
+    /// construction sites: the mask is derived from the placement lists, and
+    /// `wants` asserts in debug builds that it still agrees with them.
+    fn mask(&self) -> u64 {
+        debug_assert!(
+            ModuleId::ALL.len() <= u64::BITS as usize,
+            "more built-in modules than bits in the placed mask"
+        );
+        self.modules()
+            .filter_map(ModuleId::bit)
+            .fold(0, |mask, bit| mask | 1 << bit)
+    }
+
+    fn indexed(mut self) -> Self {
+        self.placed = self.mask();
+        self
+    }
+
     pub fn wants(&self, module: ModuleId) -> bool {
-        self.modules().any(|placed| placed == module)
+        debug_assert_eq!(
+            self.placed,
+            self.mask(),
+            "the placed mask is stale: a placement list changed after construction"
+        );
+        match module.bit() {
+            Some(bit) => self.placed & 1 << bit != 0,
+            // An extension is named by the config, so it has no bit; there are
+            // as many declared extensions as the user asked for and no more.
+            None => self.modules().any(|placed| placed == module),
+        }
     }
 
     /// The declaration behind an extension module, if the config still has one.

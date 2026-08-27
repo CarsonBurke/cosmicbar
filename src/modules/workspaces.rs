@@ -7,6 +7,7 @@
 //! module walks the workspaces of the output the pointer is on.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,9 +69,11 @@ pub enum Event {
     Disconnected,
     /// A pill was clicked.
     Focus(u64),
-    /// The pointer scrolled over the module on `output`.
+    /// The pointer scrolled over the module on `output`. The name is the one
+    /// the pill row was keyed by, so the frame that built the closure did not
+    /// have to copy it.
     Cycle {
-        output: Option<String>,
+        output: Option<Arc<str>>,
         forward: bool,
     },
     /// Result of an action, so a refusal reaches the log instead of vanishing.
@@ -79,10 +82,24 @@ pub enum Event {
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// As niri sends them; `row` imposes the per-output display order.
+    /// As niri sends them; `rebuild` imposes the per-output display order.
     workspaces: Vec<Workspace>,
     /// window id -> workspace id, the only window fact a pill needs.
     placement: HashMap<u64, u64>,
+    /// How many windows each workspace holds, folded out of `placement` as it
+    /// changes. A workspace drops out when its last window does, so a pill
+    /// asks whether its id is present rather than scanning the window table:
+    /// a frame happens on every message the bar handles, not just on a niri
+    /// event, and there can be a few dozen windows.
+    occupancy: HashMap<u64, usize>,
+    /// Every pill in display order, one output's after another's. Derived in
+    /// `update` for the same reason: a cpu sample and a clock tick both draw a
+    /// frame, and neither of them can have changed this.
+    pills: Vec<Pill>,
+    /// Where each output's pills sit in `pills`. The key is also the name the
+    /// scroll closure has to send back, so the closure shares it instead of
+    /// being handed a copy every frame.
+    outputs: HashMap<Arc<str>, Range<usize>>,
     connected: bool,
     /// Rate limit for pointer scrolling, see [`SCROLL_INTERVAL`].
     last_cycle: Option<Instant>,
@@ -101,6 +118,7 @@ impl State {
             Event::Workspaces(workspaces) => {
                 self.workspaces = Arc::unwrap_or_clone(workspaces);
                 self.connected = true;
+                self.rebuild();
             }
             Event::Activated { id, focused } => {
                 // niri's contract: activating a workspace deactivates every
@@ -119,26 +137,23 @@ impl State {
                         workspace.is_focused = workspace.id == id;
                     }
                 }
+                self.rebuild();
             }
             Event::Urgency { id, urgent } => {
                 if let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == id) {
                     workspace.is_urgent = urgent;
                 }
+                self.rebuild();
             }
             Event::Windows(placement) => {
                 self.placement = placement.iter().copied().collect();
-            }
-            Event::WindowPlaced { id, workspace } => match workspace {
-                Some(workspace) => {
-                    self.placement.insert(id, workspace);
+                self.occupancy.clear();
+                for workspace in self.placement.values() {
+                    *self.occupancy.entry(*workspace).or_default() += 1;
                 }
-                None => {
-                    self.placement.remove(&id);
-                }
-            },
-            Event::WindowClosed(id) => {
-                self.placement.remove(&id);
             }
+            Event::WindowPlaced { id, workspace } => self.place(id, workspace),
+            Event::WindowClosed(id) => self.place(id, None),
             Event::Disconnected => self.connected = false,
             Event::Focus(id) => {
                 return focus(WorkspaceReferenceArg::Id(id));
@@ -154,30 +169,26 @@ impl State {
                 // Scrolling walks the output under the pointer, which is not
                 // necessarily the focused one, so the step is resolved here
                 // and sent as an absolute id.
-                let output = output.or_else(|| {
-                    self.workspaces
-                        .iter()
-                        .find(|workspace| workspace.is_focused)
-                        .and_then(|workspace| workspace.output.clone())
-                });
-                let target = {
-                    let row = self.row(output.as_deref());
-                    let Some(current) = row.iter().position(|workspace| workspace.is_active)
-                    else {
-                        return Task::none();
-                    };
-                    // No wrap-around, matching niri's own focus-workspace-up
-                    // and -down binds.
-                    let step = if forward {
-                        current.saturating_add(1).min(row.len().saturating_sub(1))
-                    } else {
-                        current.saturating_sub(1)
-                    };
-                    if step == current {
-                        return Task::none();
-                    }
-                    row[step].id
+                let focused = self
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.is_focused)
+                    .and_then(|workspace| workspace.output.as_deref());
+                let row = self.row(output.as_deref().or(focused));
+                let Some(current) = row.iter().position(|pill| pill.is_active) else {
+                    return Task::none();
                 };
+                // No wrap-around, matching niri's own focus-workspace-up and
+                // -down binds.
+                let step = if forward {
+                    current.saturating_add(1).min(row.len().saturating_sub(1))
+                } else {
+                    current.saturating_sub(1)
+                };
+                if step == current {
+                    return Task::none();
+                }
+                let target = row[step].id;
                 self.last_cycle = Some(now);
                 return focus(WorkspaceReferenceArg::Id(target));
             }
@@ -193,37 +204,40 @@ impl State {
     /// while niri has not told us anything yet, so no empty island shows up.
     pub fn view(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
-        let pills = self.row(ctx.output.as_deref());
+        // One lookup yields both the row and the output name the scroll
+        // closure sends back, so a frame costs a refcount bump rather than a
+        // copy of the name and a sort of the table.
+        let (output, pills) = match ctx.output.as_deref() {
+            Some(name) => {
+                let (name, range) = self.outputs.get_key_value(name)?;
+                (Some(name.clone()), &self.pills[range.start..range.end])
+            }
+            None => (None, self.pills.as_slice()),
+        };
         if pills.is_empty() {
             return None;
         }
 
         let mut row = widget::Row::new().spacing(3).align_y(Alignment::Center);
-        for workspace in pills {
-            // A handful of workspaces against a few dozen windows: scanning
-            // beats keeping a second index in sync.
-            let occupied = self
-                .placement
-                .values()
-                .any(|placed| *placed == workspace.id);
-            let style = Style::of(workspace, occupied, self.connected);
+        for pill in pills {
+            let style = Style::of(pill, self.occupancy.contains_key(&pill.id), self.connected);
             // Dots, like the waybar module this replaces (`format-icons`
             // active `●` / default `○`), but drawn rather than typed: a glyph
             // sits wherever its font puts it, and at bar size that is visibly
             // off-centre. A named workspace still shows its name — that is why
             // it was named.
             let text_color = style.colors(palette).0;
-            let cell = match &workspace.name {
+            let cell = match &pill.name {
                 // A named workspace is a capsule around its text, so it keeps
                 // waybar's pill shape and fills the island's height.
                 Some(name) => crate::fill::fill(
-                    crate::theme::text(name.clone())
+                    crate::theme::text(name.as_str())
                         .size(ctx.font_size)
                         .align_y(Alignment::Center)
                         .apply(widget::button::custom)
                         .padding([NAME_PAD_Y, NAME_PAD_X])
                         .class(crate::theme::cell(text_color, [PILL_RADIUS; 4]))
-                        .on_press(event_message(Event::Focus(workspace.id))),
+                        .on_press(event_message(Event::Focus(pill.id))),
                     style.fill(palette),
                     [PILL_RADIUS; 4],
                 ),
@@ -236,7 +250,7 @@ impl State {
                         .apply(widget::button::custom)
                         .padding([0.0, DOT_PAD])
                         .class(crate::theme::cell(text_color, [0.0; 4]))
-                        .on_press(event_message(Event::Focus(workspace.id))),
+                        .on_press(event_message(Event::Focus(pill.id))),
                     style.fill(palette),
                     dot_size(ctx) + 2.0 * DOT_PAD,
                 ),
@@ -246,7 +260,6 @@ impl State {
 
         // Scrolling belongs to the whole strip, not to one pill; the pills
         // capture clicks before this ever sees them.
-        let output = ctx.output.clone();
         Some(
             widget::mouse_area(row)
                 .on_scroll(move |delta| {
@@ -276,23 +289,83 @@ impl State {
         false
     }
 
-    /// The workspaces belonging to one output, left to right by index. niri's
-    /// table order is unspecified — `Request::Workspaces` really does hand back
-    /// 3, 2, 1 — so the order is imposed here. An unknown output name means
-    /// "everything", so a compositor that never told us an output name still
-    /// gets a usable bar.
-    fn row(&self, output: Option<&str>) -> Vec<&Workspace> {
-        let mut row: Vec<&Workspace> = self
-            .workspaces
-            .iter()
-            .filter(|workspace| {
-                output.is_none_or(|output| workspace.output.as_deref() == Some(output))
-            })
-            .collect();
-        row.sort_unstable_by(|a, b| {
-            a.output.cmp(&b.output).then(a.idx.cmp(&b.idx))
-        });
-        row
+    /// Fold the workspace table into the row each output draws. niri's table
+    /// order is unspecified — `Request::Workspaces` really does hand back 3,
+    /// 2, 1 — so the order is imposed here, once per event that can change it,
+    /// instead of by every frame.
+    fn rebuild(&mut self) {
+        let mut sorted: Vec<&Workspace> = self.workspaces.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.output.cmp(&b.output).then(a.idx.cmp(&b.idx)));
+        // That order leaves each output's workspaces contiguous, so a row is a
+        // slice of the whole thing rather than a second copy of its pills.
+        self.outputs.clear();
+        let mut start = 0;
+        for group in sorted.chunk_by(|a, b| a.output == b.output) {
+            let end = start + group.len();
+            // A workspace niri has not put on an output has no row of its own;
+            // only a bar with no output name ever draws it.
+            if let Some(output) = group[0].output.as_deref() {
+                self.outputs.insert(Arc::from(output), start..end);
+            }
+            start = end;
+        }
+        self.pills = sorted.into_iter().map(Pill::of).collect();
+    }
+
+    /// Move one window between workspaces. `placement` still says where it
+    /// was, so keeping `occupancy` true costs a decrement and an increment.
+    fn place(&mut self, window: u64, workspace: Option<u64>) {
+        let previous = match workspace {
+            Some(workspace) => self.placement.insert(window, workspace),
+            None => self.placement.remove(&window),
+        };
+        if let Some(previous) = previous
+            && let Some(count) = self.occupancy.get_mut(&previous)
+        {
+            *count -= 1;
+            if *count == 0 {
+                self.occupancy.remove(&previous);
+            }
+        }
+        if let Some(workspace) = workspace {
+            *self.occupancy.entry(workspace).or_default() += 1;
+        }
+    }
+
+    /// The pills one bar surface draws, left to right. An unknown output name
+    /// means "everything", so a compositor that never told us an output name
+    /// still gets a usable bar.
+    fn row(&self, output: Option<&str>) -> &[Pill] {
+        match output {
+            Some(output) => self
+                .outputs
+                .get(output)
+                .map_or(&[][..], |range| &self.pills[range.start..range.end]),
+            None => &self.pills,
+        }
+    }
+}
+
+/// One workspace as a pill: everything drawing it needs, and nothing that
+/// would make a frame go back to the workspace table for it.
+#[derive(Debug)]
+struct Pill {
+    id: u64,
+    name: Option<String>,
+    is_active: bool,
+    is_focused: bool,
+    is_urgent: bool,
+}
+
+impl Pill {
+    fn of(workspace: &Workspace) -> Self {
+        Self {
+            id: workspace.id,
+            name: workspace.name.clone(),
+            is_active: workspace.is_active,
+            is_focused: workspace.is_focused,
+            is_urgent: workspace.is_urgent,
+        }
     }
 }
 
@@ -309,14 +382,14 @@ enum Style {
 }
 
 impl Style {
-    fn of(workspace: &Workspace, occupied: bool, connected: bool) -> Self {
+    fn of(pill: &Pill, occupied: bool, connected: bool) -> Self {
         if !connected {
             Self::Stale
-        } else if workspace.is_urgent {
+        } else if pill.is_urgent {
             Self::Urgent
-        } else if workspace.is_focused {
+        } else if pill.is_focused {
             Self::Focused
-        } else if workspace.is_active {
+        } else if pill.is_active {
             Self::Visible
         } else if occupied {
             Self::Occupied

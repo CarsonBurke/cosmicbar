@@ -365,15 +365,25 @@ pub fn cell(text_color: Color, radius: [f32; 4]) -> cosmic::theme::Button {
     }
 }
 
-/// Nerd-font family used for both text and glyph icons.
+/// Font used for normal bar text.
+///
+/// COSMIC resolves this from the desktop's interface-font setting. Keeping the
+/// family intact here means the bar follows the system instead of replacing it
+/// with a bar-specific face; only the configured weight is adjusted.
+pub fn font(bold: bool) -> Font {
+    let mut font = cosmic::font::default();
+    font.weight = if bold { Weight::Bold } else { Weight::Normal };
+    font
+}
+
+/// Nerd-font family used for glyph icons.
 ///
 /// The *Mono* variant matters. In the plain `CommitMono Nerd Font`, every icon
 /// advances one cell (0.6em) but its ink is drawn at its natural width - 0.5em
 /// for a thermometer, a full 1.0em for the wifi fan, which overflows the cell by
 /// 0.4em and crowds whatever follows it. The Mono variant squeezes every icon to
-/// the cell (ink 0.599em of a 0.600em advance, side bearings 0.001em), so the
-/// distance from any glyph to its text is the same. ASCII is identical in both.
-pub fn font(bold: bool) -> Font {
+/// the cell (ink 0.599em of a 0.600em advance, side bearings 0.001em).
+pub fn icon_font(bold: bool) -> Font {
     Font {
         family: Family::Name("CommitMono Nerd Font Mono"),
         weight: if bold { Weight::Bold } else { Weight::Normal },
@@ -381,30 +391,46 @@ pub fn font(bold: bool) -> Font {
     }
 }
 
-/// The bar's font, set once at startup. `cosmic::widget::text` hardcodes
-/// COSMIC's Open Sans, so every module builds text through here instead.
-static FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+/// The system text font, set once at startup with the bar's configured weight.
+static SYSTEM_FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
 
 pub fn set_font(font: Font) {
-    let _ = FONT.set(font);
+    let _ = SYSTEM_FONT.set(font);
 }
 
-pub fn bar_font() -> Font {
-    *FONT.get_or_init(|| font(true))
+fn bar_font() -> Font {
+    *SYSTEM_FONT.get_or_init(|| font(true))
 }
 
-/// Text in the bar's font. Use this instead of `cosmic::widget::text`.
+/// The icon font, set once at startup so icon-only widgets use the configured
+/// weight without changing the system font used by normal text.
+static ICON_FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+
+pub fn set_icon_font(font: Font) {
+    let _ = ICON_FONT.set(font);
+}
+
+fn bar_icon_font() -> Font {
+    *ICON_FONT.get_or_init(|| icon_font(true))
+}
+
+/// Text in the system interface font.
 pub fn text<'a>(
     content: impl Into<std::borrow::Cow<'a, str>> + 'a,
 ) -> cosmic::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
     cosmic::widget::text(content).font(bar_font())
 }
 
-/// Gap between a module's glyph *ink* and its text, in logical pixels. A space
-/// inside one text run is a whole mono advance — ten pixels at the bar's font
-/// size — which reads as a hole; four is too tight against a digit. This is the
-/// distance the waybar it replaces ended up with once its own space had lost the
-/// icon's side bearings.
+/// Text rendered with the bar's Nerd Font icon face.
+pub fn icon_text<'a>(
+    content: impl Into<std::borrow::Cow<'a, str>> + 'a,
+) -> cosmic::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    cosmic::widget::text(content).font(bar_icon_font())
+}
+
+/// Gap between a module's glyph *ink* and its system-font text, in logical
+/// pixels. A fixed gap keeps icon bearings from changing the spacing between
+/// modules.
 pub const GLYPH_GAP: f32 = 6.0;
 
 /// Icons in the Mono nerd variant fill exactly one text cell, so at the text's
@@ -440,15 +466,17 @@ pub fn label<'a, Message: 'a>(
         .into()
 }
 
-/// One character's advance in the bar's font, as a fraction of the text size.
-/// Every glyph in `CommitMono Nerd Font Mono` advances the same 0.6em, icons
-/// included, which is what makes a character count a usable width.
+/// Advance of one character in the Nerd Font's monospaced icon cell.
 const MONO_ADVANCE: f32 = 0.6;
 
-/// Width of `text` at `size`, in logical pixels. Exact rather than a guess: the
-/// bar's font is the mono variant, so every character is the same cell wide.
+/// Approximate width of `text` at `size`, in logical pixels.
+///
+/// System text is proportional, so this estimate is intentionally conservative
+/// for popup wrapping and reservation calculations.
+const SYSTEM_ADVANCE: f32 = 0.6;
+
 pub fn text_width(text: &str, size: f32) -> f32 {
-    text.chars().count() as f32 * MONO_ADVANCE * size
+    text.chars().count() as f32 * SYSTEM_ADVANCE * size
 }
 
 /// A bar label whose text keeps a fixed field, so the island does not resize as
@@ -474,12 +502,9 @@ pub fn label_fixed<'a, Message: 'a>(
     let glyph = glyph.into();
     let bearing = crate::glyph::right_bearing(&glyph) * size * GLYPH_SCALE;
     let gap = (GLYPH_GAP - bearing).max(0.0);
-    // The row at its widest: one glyph cell, the gap, and the field. Every glyph
-    // in the mono variant advances the same cell, so this is exact rather than a
-    // measurement of the text that happens to be on screen.
-    let widest = MONO_ADVANCE * GLYPH_SCALE * size
-        + gap
-        + widest.chars().count() as f32 * MONO_ADVANCE * size;
+    // Nerd icons retain their fixed cell advance; system text is proportional,
+    // so use the same conservative estimate as popup wrapping.
+    let widest = MONO_ADVANCE * GLYPH_SCALE * size + gap + text_width(widest, size);
     let row = cosmic::widget::Row::new()
         .push(glyph_text(glyph, size).class(class))
         .push(text(rest).size(size).class(class))
@@ -497,7 +522,7 @@ pub fn glyph_text<'a>(
     glyph: impl Into<std::borrow::Cow<'a, str>> + 'a,
     size: f32,
 ) -> cosmic::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    text(glyph).size(size * GLYPH_SCALE)
+    icon_text(glyph).size(size * GLYPH_SCALE)
 }
 
 /// Icon-only cells: a lone glyph has no digits to sit level with, so it is drawn
@@ -510,7 +535,7 @@ pub fn glyph_only<'a>(
     glyph: impl Into<std::borrow::Cow<'a, str>> + 'a,
     size: f32,
 ) -> cosmic::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    text(glyph).size(size * GLYPH_ONLY_SCALE).line_height(
+    icon_text(glyph).size(size * GLYPH_ONLY_SCALE).line_height(
         cosmic::iced::widget::text::LineHeight::Absolute(cosmic::iced::Pixels(
             size * GLYPH_ONLY_SCALE,
         )),

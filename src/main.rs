@@ -12,6 +12,7 @@ mod fill;
 mod glyph;
 mod hover;
 mod modules;
+mod popup;
 mod theme;
 
 fn main() -> cosmic::iced::Result {
@@ -34,6 +35,7 @@ fn main() -> cosmic::iced::Result {
     let config = config::Config::load();
 
     theme::set_font(theme::font(config.font_weight_bold));
+    theme::set_icon_font(theme::icon_font(config.font_weight_bold));
 
     let settings = cosmic::app::Settings::default()
         // The bar owns layer surfaces only: no xdg-toplevel, and closing a

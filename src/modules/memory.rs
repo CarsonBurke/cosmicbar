@@ -18,6 +18,7 @@ use cosmic::{Apply, Element};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card};
 use crate::theme::{Island, Palette};
 
 /// waybar: `#memory` sits on `@cpu` = surface0.
@@ -40,7 +41,13 @@ const ICON_CACHE: &str = "\u{f01bc}";
 /// md-checkbox_blank_circle_outline, for the available row.
 const ICON_FREE: &str = "\u{f0130}";
 
+/// Height of the usage meter, and of the slimmer bar under each process.
 const METER_HEIGHT: f32 = 7.0;
+const PROCESS_METER_HEIGHT: f32 = 3.0;
+/// Width of the label column in every detail row. Fixed rather than
+/// shrink-to-fit: it is what puts the available, cache and swap values in one
+/// column instead of at three different indents.
+const LABEL_WIDTH: f32 = 76.0;
 /// Processes listed in the popup.
 const TOP_PROCESSES: usize = 5;
 /// x86-64 base page size; `/proc/<pid>/statm` counts pages, and this kernel
@@ -195,48 +202,8 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let sample = self.sample.as_ref()?;
         let palette = &ctx.palette;
-        let small = ctx.small();
         let percent = sample.percent();
         let (_, color) = state(percent, palette);
-
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
-
-        body = body.push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text(format!(
-                        "{:.1} GiB of {:.1} GiB",
-                        gib(sample.used_kib()),
-                        gib(sample.total_kib)
-                    ))
-                    .width(Length::Fill),
-                )
-                .push(
-                    crate::theme::text(format!("{percent:.0}%"))
-                        .class(cosmic::theme::Text::Color(color)),
-                )
-                .align_y(Alignment::Center)
-                .spacing(8),
-        );
-        body = body.push(meter(percent / 100.0, palette, METER_HEIGHT));
-
-        body = body.push(widget::divider::horizontal::default());
-        body = body.push(row(
-            ICON_FREE,
-            "available",
-            format!("{:.1} GiB", gib(sample.available_kib)),
-            palette.green,
-            palette,
-            small,
-        ));
-        body = body.push(row(
-            ICON_CACHE,
-            "page cache",
-            format!("{:.1} GiB", gib(sample.cached_kib)),
-            palette.blue,
-            palette,
-            small,
-        ));
 
         let swap = if sample.swap_total_kib == 0 {
             "none".to_string()
@@ -253,12 +220,48 @@ impl State {
         } else {
             palette.muted()
         };
-        body = body.push(row(
-            ICON_SWAP, "swap", swap, swap_color, palette, small,
-        ));
+
+        let mut card = Card::new()
+            .block(
+                popup::column()
+                    .push(popup::split(
+                        popup::title(
+                            format!(
+                                "{:.1} GiB of {:.1} GiB",
+                                gib(sample.used_kib()),
+                                gib(sample.total_kib)
+                            ),
+                            ctx,
+                        ),
+                        [popup::title(format!("{percent:.0}%"), ctx)
+                            .class(cosmic::theme::Text::Color(color))
+                            .into()],
+                    ))
+                    .push(meter(percent / 100.0, palette, METER_HEIGHT)),
+            )
+            .block(
+                popup::column()
+                    .push(popup::section("breakdown", ctx))
+                    .push(row(
+                        ICON_FREE,
+                        "available",
+                        format!("{:.1} GiB", gib(sample.available_kib)),
+                        palette.green,
+                        ctx,
+                    ))
+                    .push(row(
+                        ICON_CACHE,
+                        "page cache",
+                        format!("{:.1} GiB", gib(sample.cached_kib)),
+                        palette.blue,
+                        ctx,
+                    ))
+                    .push(row(ICON_SWAP, "swap", swap, swap_color, ctx)),
+            );
 
         if !sample.top.is_empty() {
-            body = body.push(widget::divider::horizontal::default());
+            // Scaled against the biggest listed process, not total RAM: on
+            // 96 GiB every bar would otherwise be a sliver.
             let largest = sample
                 .top
                 .iter()
@@ -266,47 +269,39 @@ impl State {
                 .max()
                 .unwrap_or(1)
                 .max(1);
+            let mut block = popup::column().push(popup::section("processes", ctx));
             for process in &sample.top {
-                body = body.push(
-                    widget::Column::new()
-                        .push(
-                            widget::Row::new()
-                                .push(
-                                    crate::theme::text(process.name.as_str())
-                                        .size(small)
-                                        .width(Length::Fill),
-                                )
-                                .push(
-                                    crate::theme::text(format!("{}", process.pid))
-                                        .size(small)
-                                        .class(cosmic::theme::Text::Color(palette.overlay0)),
-                                )
-                                .push(
-                                    crate::theme::text(format!(
+                block = block.push(
+                    popup::lines()
+                        .push(popup::split(
+                            popup::item(process.name.as_str(), ctx),
+                            [
+                                popup::detail(format!("{}", process.pid), ctx)
+                                    .class(cosmic::theme::Text::Color(palette.overlay0))
+                                    .into(),
+                                popup::detail(
+                                    format!(
                                         "{:>5.0} MiB",
                                         process.rss_bytes as f64 / (KIB * KIB)
-                                    ))
-                                    .size(small)
-                                    .class(cosmic::theme::Text::Color(palette.mauve)),
+                                    ),
+                                    ctx,
                                 )
-                                .align_y(Alignment::Center)
-                                .spacing(8),
-                        )
-                        // Scaled against the biggest listed process, not total
-                        // RAM: on 96 GiB every bar would otherwise be a sliver.
+                                .class(cosmic::theme::Text::Color(palette.mauve))
+                                .into(),
+                            ],
+                        ))
                         .push(bar(
                             process.rss_bytes as f32 / largest as f32,
                             palette.mauve,
                             palette,
-                            3.0,
-                        ))
-                        .spacing(2)
-                        .width(Length::Fill),
+                            PROCESS_METER_HEIGHT,
+                        )),
                 );
             }
+            card = card.block(block);
         }
 
-        Some(body.apply(widget::container).padding(12).into())
+        Some(card.build())
     }
 }
 
@@ -334,34 +329,30 @@ fn gib(kib: u64) -> f64 {
     kib as f64 / (KIB * KIB)
 }
 
-/// A labelled popup row: icon, name, value.
+/// One detail row: its glyph, its label in the column every other label in the
+/// card shares, and its value. The glyph takes the value's colour because what
+/// it reports is the state of that reading.
 fn row<'a>(
     icon: &'a str,
     label: &'a str,
     value: String,
     value_color: Color,
-    palette: &Palette,
-    size: f32,
+    ctx: &Ctx,
 ) -> Element<'a, Message> {
     widget::Row::new()
         .push(
-            crate::theme::text(icon)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.overlay0)),
-        )
-        .push(
-            crate::theme::text(label)
-                .size(size)
-                .class(cosmic::theme::Text::Color(palette.muted()))
-                .width(Length::Fill),
-        )
-        .push(
-            crate::theme::text(value)
-                .size(size)
+            crate::theme::icon_text(icon)
+                .size(ctx.small())
                 .class(cosmic::theme::Text::Color(value_color)),
         )
+        .push(popup::section(label, ctx).width(Length::Fixed(LABEL_WIDTH)))
+        .push(
+            popup::detail(value, ctx)
+                .class(cosmic::theme::Text::Color(value_color))
+                .width(Length::Fill),
+        )
         .align_y(Alignment::Center)
-        .spacing(8)
+        .spacing(popup::ROW_GAP)
         .into()
 }
 

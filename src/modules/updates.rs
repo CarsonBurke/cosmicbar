@@ -26,14 +26,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
-use cosmic::iced::{Alignment, Length, Subscription};
-use cosmic::widget;
-use cosmic::{Apply, Element};
+use cosmic::iced::{Alignment, Subscription};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar painted `#custom-system_update` `@tray`, which is `@mantle`.
@@ -63,8 +63,6 @@ const HELPERS: [&str; 5] = ["aura", "paru", "pikaur", "trizen", "yay"];
 /// Rows the popup will render; a 900 package rebuild does not need a widget
 /// each.
 const LIST_LIMIT: usize = 200;
-/// Height of the scrollable package list, in logical pixels.
-const LIST_HEIGHT: f32 = 320.0;
 
 #[derive(Debug, Clone)]
 pub struct Update {
@@ -238,7 +236,6 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let report = self.report.as_ref()?;
         let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
 
         // Which AUR helper answered is not news every time the popup opens, so
         // the header is the two counts and nothing else.
@@ -249,62 +246,40 @@ impl State {
             }
             None => format!("{} official", report.repo.len()),
         };
-        body = body.push(
-            crate::theme::text(headline).class(cosmic::theme::Text::Color(
+        let mut card = Card::new().block(popup::split(
+            popup::title(headline, ctx).class(cosmic::theme::Text::Color(
                 if report.error.is_some() {
                     palette.red
                 } else {
                     palette.accent()
                 },
             )),
-        );
+            [],
+        ));
 
-        let mut list = widget::Column::new().spacing(1).width(Length::Fill);
+        let mut list = popup::column();
         let mut shown = 0usize;
         for (label, updates) in [("", &report.repo), ("aur", &report.aur)] {
             if updates.is_empty() {
                 continue;
             }
             if !label.is_empty() {
-                list = list.push(
-                    crate::theme::text(label)
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.overlay0)),
-                );
+                list = list.push(popup::section(label, ctx));
             }
             for update in updates.iter().take(LIST_LIMIT.saturating_sub(shown)) {
                 shown += 1;
-                list = list.push(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(update.name.as_str())
-                                .size(ctx.small())
-                                .width(Length::Fill),
-                        )
-                        .push(
-                            crate::theme::text(format!("{} → {}", update.from, update.to))
-                                .size(ctx.small())
-                                .class(cosmic::theme::Text::Color(palette.muted())),
-                        )
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                );
+                list = list.push(popup::split(
+                    popup::item(update.name.as_str(), ctx),
+                    [popup::detail(format!("{} → {}", update.from, update.to), ctx).into()],
+                ));
             }
         }
         let hidden = report.total().saturating_sub(shown);
         if hidden > 0 {
-            list = list.push(
-                crate::theme::text(format!("… {hidden} more"))
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.overlay0)),
-            );
+            list = list.push(popup::detail(format!("… {hidden} more"), ctx));
         }
         if shown > 0 {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(
-                    widget::scrollable(list).height(Length::Fixed(LIST_HEIGHT)),
-                );
+            card = card.list(list);
         }
 
         let checked = if report.checked_ms == 0 {
@@ -315,47 +290,41 @@ impl State {
                 crate::bar::local(report.checked_ms).strftime("%H:%M")
             )
         };
-        body = body.push(widget::divider::horizontal::default()).push(
-            widget::Row::new()
-                .push(
-                    crate::theme::text(if self.checking {
-                        "checking…".to_owned()
-                    } else {
-                        checked
-                    })
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted()))
-                    .width(Length::Fill),
-                )
-                .push(
-                    widget::button::text("check now")
-                        .class(crate::theme::chip(palette))
-                        .on_press_maybe((!self.checking).then(|| event_message(Event::CheckNow))),
-                )
-                .push(
-                    widget::button::text("update")
-                        .class(crate::theme::chip_accent(palette))
-                        .on_press_maybe(
-                        (report.total() > 0).then(|| {
-                            event_message(Event::Upgrade {
-                                terminal: ctx.terminal.clone(),
-                            })
-                        }),
-                    ),
-                )
-                .align_y(Alignment::Center)
-                .spacing(6),
-        );
+        card = card.block(popup::split(
+            popup::detail(
+                if self.checking {
+                    "checking…".to_owned()
+                } else {
+                    checked
+                },
+                ctx,
+            ),
+            [
+                popup::chip(
+                    "check now",
+                    Chip::Plain,
+                    ctx,
+                    (!self.checking).then(|| event_message(Event::CheckNow)),
+                ),
+                popup::chip(
+                    "update",
+                    Chip::Accent,
+                    ctx,
+                    (report.total() > 0).then(|| {
+                        event_message(Event::Upgrade {
+                            terminal: ctx.terminal.clone(),
+                        })
+                    }),
+                ),
+            ],
+        ));
 
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.as_str())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .build(),
+        )
     }
 
     /// Nothing here changes per second.

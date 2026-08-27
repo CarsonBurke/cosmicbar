@@ -28,17 +28,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt, channel::mpsc::Sender};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Length, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 use zbus::message::{Message as BusMessage, Type as MessageType};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::{Island, Palette};
 
 /// waybar drew `#network` on the `@tray` (mantle) background.
@@ -421,90 +422,100 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let snapshot = self.snapshot.as_ref().filter(|_| self.available)?;
         let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
 
-        let (glyph, _, color) = snapshot.headline(&palette);
-        let mut header = widget::Row::new()
-            .align_y(Alignment::Center)
-            .spacing(8)
-            .push(
-                // The bar cell is the glyph alone, so the popup is where the
-                // network's name is spelled out.
-                crate::theme::label(
-                    glyph,
-                    snapshot.name(),
-                    ctx.font_size,
-                    cosmic::theme::Text::Color(color),
-                )
-                .apply(widget::container)
-                .width(Length::Fill),
-            );
+        let mut actions = Vec::new();
         if snapshot.wifi.is_some() {
             if snapshot.wireless_enabled {
-                header = header.push(button(palette, ICON_SCAN, Event::Rescan));
+                actions.push(popup::icon_chip(
+                    ICON_SCAN,
+                    Chip::Plain,
+                    ctx,
+                    Some(event_message(Event::Rescan)),
+                ));
             }
-            header = header.push(button(
-                palette,
+            actions.push(popup::chip(
                 if snapshot.wireless_enabled {
                     "wifi off"
                 } else {
                     "wifi on"
                 },
-                Event::SetWireless(!snapshot.wireless_enabled),
+                Chip::Plain,
+                ctx,
+                Some(event_message(Event::SetWireless(
+                    !snapshot.wireless_enabled,
+                ))),
             ));
         }
-        header = header.push(button(
-            palette,
+        actions.push(popup::icon_chip(
             ICON_TERMINAL,
-            Event::Nmtui(ctx.terminal.clone()),
+            Chip::Plain,
+            ctx,
+            Some(event_message(Event::Nmtui(ctx.terminal.clone()))),
         ));
-        body = body
-            .push(header)
-            .push(detail(
-                ctx,
-                "state",
-                state_name(snapshot.state, snapshot.connectivity),
-            ));
 
+        // The bar cell is the glyph alone, so the popup is where the network's
+        // name is spelled out.
+        let (glyph, _, color) = snapshot.headline(&palette);
+        let mut card = Card::new().block(popup::split(
+            crate::theme::label(
+                glyph,
+                snapshot.name(),
+                ctx.font_size,
+                cosmic::theme::Text::Color(color),
+            ),
+            actions,
+        ));
+
+        let mut connection = popup::column().push(field(
+            ctx,
+            "state",
+            state_name(snapshot.state, snapshot.connectivity),
+        ));
         if let Some(active) = &snapshot.primary {
             if !active.device.iface.is_empty() {
-                body = body.push(detail(ctx, "interface", active.device.iface.clone()));
+                connection = connection.push(field(ctx, "interface", active.device.iface.clone()));
             }
             if !active.ip4.addresses.is_empty() {
-                body = body.push(detail(ctx, "ipv4", active.ip4.addresses.join(", ")));
+                connection = connection.push(field(ctx, "ipv4", active.ip4.addresses.join(", ")));
             }
             if let Some(gateway) = &active.ip4.gateway {
-                body = body.push(detail(ctx, "gateway", gateway.clone()));
+                connection = connection.push(field(ctx, "gateway", gateway.clone()));
             }
             if !active.ip4.dns.is_empty() {
-                body = body.push(detail(ctx, "dns", active.ip4.dns.join(", ")));
+                connection = connection.push(field(ctx, "dns", active.ip4.dns.join(", ")));
             }
             if let Some(ap) = &active.ap {
-                let mut signal = format!("{}% · {:.3} GHz", ap.strength, ap.frequency as f32 / 1000.0);
+                let mut signal =
+                    format!("{}% · {:.3} GHz", ap.strength, ap.frequency as f32 / 1000.0);
                 if let Some(bitrate) = active.bitrate {
                     signal.push_str(&format!(" · {} Mb/s", bitrate / 1000));
                 }
-                body = body.push(detail(ctx, "signal", signal));
+                connection = connection.push(field(ctx, "signal", signal));
             }
             if let Some(speed) = active.speed.filter(|speed| *speed > 0) {
                 let carrier = match active.carrier {
                     Some(false) => " · no carrier",
                     _ => "",
                 };
-                body = body.push(detail(ctx, "link", format!("{speed} Mb/s{carrier}")));
+                connection = connection.push(field(ctx, "link", format!("{speed} Mb/s{carrier}")));
             }
-            match self.rates {
+            connection = connection.push(match self.rates {
                 Some((rx, tx)) => {
-                    body = body.push(detail(
+                    // Down and up are one reading, so each direction keeps its
+                    // glyph beside its own number the way a bar cell does.
+                    let muted = cosmic::theme::Text::Color(palette.muted());
+                    labelled(
                         ctx,
                         "traffic",
-                        format!("{ICON_DOWN} {}   {ICON_UP} {}", rate(rx), rate(tx)),
-                    ));
+                        widget::Row::new()
+                            .push(crate::theme::label(ICON_DOWN, rate(rx), ctx.small(), muted))
+                            .push(crate::theme::label(ICON_UP, rate(tx), ctx.small(), muted))
+                            .spacing(popup::ROW_GAP)
+                            .width(Length::Fill),
+                    )
                 }
-                None => {
-                    body = body.push(detail(ctx, "traffic", "sampling…".into()));
-                }
-            }
+                None => field(ctx, "traffic", "sampling…"),
+            });
             if !snapshot.secondary.is_empty() {
                 let also = snapshot
                     .secondary
@@ -512,9 +523,10 @@ impl State {
                     .map(|active| active.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                body = body.push(detail(ctx, "also up", also));
+                connection = connection.push(field(ctx, "also up", also));
             }
         }
+        card = card.block(connection);
 
         // Saved profiles, active ones first. Both lists are capped: the bar
         // clips a popup at 720px, and a list that runs past the edge is worse
@@ -525,22 +537,22 @@ impl State {
             .filter(|profile| profile.kind != "loopback")
             .collect();
         if !profiles.is_empty() {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(section(ctx, "saved"));
-            for profile in profiles.iter().take(PROFILE_LIMIT) {
+            let mut saved = popup::column().push(popup::section("saved", ctx));
+            for &profile in profiles.iter().take(PROFILE_LIMIT) {
                 let action = match &profile.active {
                     Some(active) => self.action(
-                        palette,
+                        ctx,
                         "down",
+                        Chip::Danger,
                         active,
                         Event::Deactivate {
                             active: active.clone(),
                         },
                     ),
                     None => self.action(
-                        palette,
+                        ctx,
                         "up",
+                        Chip::Plain,
                         &profile.path,
                         Event::Activate {
                             profile: profile.path.clone(),
@@ -550,63 +562,38 @@ impl State {
                         },
                     ),
                 };
-                body = body.push(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(elide(&profile.id, SSID_LIMIT))
-                                .class(cosmic::theme::Text::Color(if profile.active.is_some() {
-                                    palette.green
-                                } else {
-                                    palette.fg()
-                                }))
-                                .width(Length::Fill),
-                        )
-                        .push(
-                            crate::theme::text(kind_name(&profile.kind).to_string())
-                                .size(ctx.small())
-                                .class(cosmic::theme::Text::Color(palette.overlay0)),
-                        )
-                        .push(action)
-                        .align_y(Alignment::Center)
-                        .spacing(8),
-                );
+                saved = saved.push(popup::split(
+                    popup::item(elide(&profile.id, SSID_LIMIT), ctx).class(
+                        cosmic::theme::Text::Color(if profile.active.is_some() {
+                            palette.green
+                        } else {
+                            palette.fg()
+                        }),
+                    ),
+                    [popup::detail(kind_name(&profile.kind), ctx).into(), action],
+                ));
             }
-            body = more(body, ctx, profiles.len(), PROFILE_LIMIT);
+            card = card.block(more(saved, ctx, profiles.len(), PROFILE_LIMIT));
         }
 
         if let Some(wifi) = &snapshot.wifi {
-            body = body
-                .push(widget::divider::horizontal::default())
-                .push(section(ctx, "nearby"));
+            let mut nearby = popup::column().push(popup::section("nearby", ctx));
             if !snapshot.wireless_enabled {
-                body = body.push(
-                    crate::theme::text("radio off")
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.muted())),
-                );
+                nearby = nearby.push(popup::detail("radio off", ctx));
             } else if snapshot.aps.is_empty() {
-                body = body.push(
-                    crate::theme::text("scanning…")
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(palette.muted())),
-                );
+                nearby = nearby.push(popup::detail("scanning…", ctx));
             }
             for ap in snapshot.aps.iter().take(AP_LIMIT) {
-                let security = if ap.security == "open" {
-                    ap.security.to_string()
-                } else {
-                    format!("{ICON_LOCK} {}", ap.security)
-                };
                 let action: Element<'_, Message> = if ap.active {
-                    crate::theme::text("active")
-                        .size(ctx.small())
+                    popup::detail("active", ctx)
                         .class(cosmic::theme::Text::Color(palette.green))
                         .into()
                 } else {
                     match &ap.profile {
                         Some(profile) => self.action(
-                            palette,
+                            ctx,
                             "join",
+                            Chip::Plain,
                             profile,
                             Event::Activate {
                                 profile: profile.clone(),
@@ -615,64 +602,74 @@ impl State {
                             },
                         ),
                         // A new SSID needs a passphrase prompt: that is nmtui's job.
-                        None => button(palette, ICON_TERMINAL, Event::Nmtui(ctx.terminal.clone())),
+                        None => popup::icon_chip(
+                            ICON_TERMINAL,
+                            Chip::Plain,
+                            ctx,
+                            Some(event_message(Event::Nmtui(ctx.terminal.clone()))),
+                        ),
                     }
                 };
-                body = body.push(
-                    widget::Row::new()
-                        .push(
-                            crate::theme::text(format!(
-                                "{} {}",
-                                wifi_icon(ap.strength),
-                                elide(&ap.ssid, SSID_LIMIT)
-                            ))
-                            .class(cosmic::theme::Text::Color(if ap.active {
-                                palette.green
-                            } else {
-                                palette.fg()
-                            }))
-                            .width(Length::Fill),
+                let name = cosmic::theme::Text::Color(if ap.active {
+                    palette.green
+                } else {
+                    palette.fg()
+                });
+                // The padlock belongs to the security word, not to the row, so
+                // it travels with it as one label.
+                let security: Element<'_, Message> = if ap.security == "open" {
+                    popup::detail(ap.security, ctx).into()
+                } else {
+                    crate::theme::label(
+                        ICON_LOCK,
+                        ap.security,
+                        ctx.small(),
+                        cosmic::theme::Text::Color(palette.muted()),
+                    )
+                };
+                nearby = nearby.push(popup::split(
+                    crate::theme::label(
+                        wifi_icon(ap.strength),
+                        elide(&ap.ssid, SSID_LIMIT),
+                        ctx.body(),
+                        name,
+                    ),
+                    [
+                        popup::detail(
+                            format!("{}% · {}", ap.strength, band(ap.frequency)),
+                            ctx,
                         )
-                        .push(
-                            crate::theme::text(format!(
-                                "{}% · {} · {security}",
-                                ap.strength,
-                                band(ap.frequency)
-                            ))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.overlay0)),
-                        )
-                        .push(action)
-                        .align_y(Alignment::Center)
-                        .spacing(8),
-                );
+                        .into(),
+                        security,
+                        action,
+                    ],
+                ));
             }
-            body = more(body, ctx, snapshot.aps.len(), AP_LIMIT);
+            card = card.block(more(nearby, ctx, snapshot.aps.len(), AP_LIMIT));
         }
 
-        if let Some(error) = &self.error {
-            body = body.push(widget::divider::horizontal::default()).push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx)
+                    .class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .build(),
+        )
     }
 
-    /// A row button that turns into an inert `…` while its call is in flight.
+    /// A row's own chip, inert while the call it fired is in flight: the
+    /// affordance stays where it was instead of the row reflowing around a
+    /// button that vanished.
     fn action<'a>(
         &self,
-        palette: Palette,
+        ctx: &Ctx,
         label: &'a str,
+        style: Chip,
         key: &str,
         event: Event,
     ) -> Element<'a, Message> {
-        if self.busy.as_deref() == Some(key) {
-            return crate::theme::text("…").into();
-        }
-        button(palette, label, event)
+        let idle = self.busy.as_deref() != Some(key);
+        popup::chip(label, style, ctx, idle.then(|| event_message(event)))
     }
 }
 
@@ -861,35 +858,32 @@ fn elide(text: &str, limit: usize) -> String {
     format!("{kept}…")
 }
 
-/// A text button whose label is drawn in the bar's font: `button::text` would
-/// hand the label to COSMIC's Open Sans and render every nerd glyph as tofu.
-fn button<'a>(
-    palette: Palette,
-    label: impl Into<std::borrow::Cow<'a, str>> + 'a,
-    event: Event,
+/// Width of the label column in the connection block. Fixed rather than sized
+/// to each label, because it is what makes the labels of one block line up:
+/// shrink-to-fit would start every value at its own left edge.
+const LABEL_WIDTH: f32 = 76.0;
+
+/// One line of the connection block: its label in that column, its value
+/// beside it.
+fn labelled<'a>(
+    ctx: &Ctx,
+    label: &'a str,
+    value: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    widget::button::custom(crate::theme::text(label))
-        .class(crate::theme::chip(palette))
-        .on_press(event_message(event))
+    widget::Row::new()
+        .spacing(popup::ROW_GAP)
+        .push(popup::section(label, ctx).width(Length::Fixed(LABEL_WIDTH)))
+        .push(value)
         .into()
 }
 
-fn detail<'a>(ctx: &Ctx, label: &'a str, value: String) -> Element<'a, Message> {
-    widget::Row::new()
-        .spacing(8)
-        .push(
-            crate::theme::text(label)
-                .size(ctx.small())
-                .class(cosmic::theme::Text::Color(ctx.palette.overlay0))
-                .width(Length::Fixed(76.0)),
-        )
-        .push(
-            crate::theme::text(value)
-                .size(ctx.small())
-                .class(cosmic::theme::Text::Color(ctx.palette.muted()))
-                .width(Length::Fill),
-        )
-        .into()
+/// The common case, where the value is nothing but text.
+fn field<'a>(
+    ctx: &Ctx,
+    label: &'a str,
+    value: impl Into<std::borrow::Cow<'a, str>> + 'a,
+) -> Element<'a, Message> {
+    labelled(ctx, label, popup::detail(value, ctx).width(Length::Fill))
 }
 
 /// `+N more` when a list was cut off.
@@ -902,18 +896,7 @@ fn more<'a>(
     if total <= limit {
         return body;
     }
-    body.push(
-        crate::theme::text(format!("+{} more", total - limit))
-            .size(ctx.small())
-            .class(cosmic::theme::Text::Color(ctx.palette.overlay0)),
-    )
-}
-
-fn section<'a>(ctx: &Ctx, label: &'a str) -> Element<'a, Message> {
-    crate::theme::text(label)
-        .size(ctx.small())
-        .class(cosmic::theme::Text::Color(ctx.palette.overlay0))
-        .into()
+    body.push(popup::detail(format!("+{} more", total - limit), ctx))
 }
 
 // ---------------------------------------------------------------- subscription

@@ -47,6 +47,15 @@ enum Seen {
     Gone,
 }
 
+impl Seen {
+    /// Whether the pointer is on this surface as far as it has been told. This
+    /// is the whole of what the guard changes about drawing, so it is also what
+    /// decides whether a pointer event is worth a repaint.
+    fn inside(&self) -> bool {
+        !matches!(self, Self::Gone)
+    }
+}
+
 impl Guard<'_> {
     /// The cursor as the subtree should *see* it: the position this surface was
     /// last told about, not the one the runtime kept from an earlier frame.
@@ -128,10 +137,19 @@ impl Widget<Message, Theme, Renderer> for Guard<'_> {
             _ => None,
         };
         if let Some(seen) = seen {
-            *tree.state.downcast_mut::<Seen>() = seen;
-            // A compositor only sends motion for the surface under the pointer,
-            // so this asks for a frame exactly while the user is on the bar.
-            shell.request_redraw();
+            let state = tree.state.downcast_mut::<Seen>();
+            // Only crossing the surface's edge changes what this widget makes
+            // the subtree draw, and a pointer sweeping across the bar delivers
+            // motion at the device's report rate — hundreds of events a second,
+            // each of which would otherwise repaint every cell on the bar. The
+            // paint that does follow the cursor is `fill::FillBox`'s fade, and
+            // that asks for its own frames when the cell it wraps is entered or
+            // left.
+            let crossed = state.inside() != seen.inside();
+            *state = seen;
+            if crossed {
+                shell.request_redraw();
+            }
         }
         // The subtree always gets the true cursor for events: a press outside
         // our bounds is not ours to hide, and a drag that leaves the surface

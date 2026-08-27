@@ -11,14 +11,14 @@
 
 use std::sync::Arc;
 
+use cosmic::Element;
 use cosmic::app::Task;
+use cosmic::iced::Subscription;
 use cosmic::iced::futures::{Stream, StreamExt};
-use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 
 use crate::bar::Message;
-use crate::extension::{self, Command, Frame, Item, Line};
+use crate::extension::{self, Command, Frame, Item, Line, Row};
 use crate::modules::{Ctx, ModuleEvent};
 
 #[derive(Debug, Clone)]
@@ -33,21 +33,6 @@ pub enum Event {
 /// Island role: an extension is one flat cell beside its neighbours, the way
 /// the built-in single-cell modules are.
 pub const ISLAND: crate::theme::Island = crate::theme::Island::Flat;
-/// Estimating how tall a frame wants to be: iced's default relative line
-/// height, the `Column` spacing between items, the tighter spacing between the
-/// lines inside a row, the gap before a row's button, and a divider's own line.
-const LINE_HEIGHT: f32 = 1.4;
-const ITEM_SPACING: f32 = 6.0;
-const LINE_SPACING: f32 = 1.0;
-const ROW_SPACING: f32 = 8.0;
-const DIVIDER_ROW: f32 = 1.0;
-/// This popup's own padding, and the width a scrollbar takes off the text.
-const PADDING: f32 = 12.0;
-const SCROLLBAR: f32 = 10.0;
-/// libcosmic draws button labels at its own fixed size, not the bar's.
-const BUTTON_TEXT: f32 = 14.0;
-/// Where an extension's list starts scrolling instead of growing.
-const LIST_HEIGHT: f32 = 420.0;
 
 #[derive(Debug)]
 pub struct State {
@@ -142,122 +127,77 @@ impl State {
         ))
     }
 
-    /// Mirrors `popup`'s own test: a frame with an empty popup is a cell that
-    /// does not click.
+    /// Mirrors `popup`'s own test: a frame with nothing in its popup is a cell
+    /// that does not click.
     pub fn has_popup(&self) -> bool {
         self.frame
             .as_ref()
-            .is_some_and(|frame| !frame.popup.is_empty())
+            .is_some_and(|frame| frame.header.is_some() || !frame.popup.is_empty())
     }
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let frame = self.frame.as_ref()?;
-        if frame.popup.is_empty() {
+        if frame.header.is_none() && frame.popup.is_empty() {
             return None;
         }
-        let mut body = widget::Column::new()
-            .spacing(ITEM_SPACING)
-            .width(Length::Fill);
-        for item in &frame.popup {
-            body = body.push(match item {
-                Item::Divider => widget::divider::horizontal::default().into(),
-                Item::Text(line) => self.line(line, ctx),
-                Item::Row(row) => {
-                    let mut lines = widget::Column::new()
-                        .spacing(LINE_SPACING)
-                        .width(Length::Fill);
-                    for line in &row.lines {
-                        lines = lines.push(self.line(line, ctx));
-                    }
-                    let mut content = widget::Row::new()
-                        .push(lines)
-                        .spacing(ROW_SPACING)
-                        .align_y(Alignment::Center);
-                    if let Some(action) = &row.action {
-                        let class = if action.danger {
-                            crate::theme::chip_danger(ctx.palette)
-                        } else {
-                            crate::theme::chip(ctx.palette)
-                        };
-                        content = content.push(
-                            widget::button::text(action.label.as_str())
-                                .class(class)
-                                .on_press_maybe(action.enabled.then(|| {
-                                    Message::Module(ModuleEvent::Extension(
-                                        self.index,
-                                        Event::Press(action.id.clone()),
-                                    ))
-                                })),
-                        );
-                    }
-                    content.into()
-                }
-            });
+        let mut card = crate::popup::Card::new();
+        if let Some(header) = &frame.header {
+            card = card.block(self.row(header, ctx, true));
         }
-        // How long the list is belongs to the extension, and a popup taller than
-        // the bar's own limit is never mapped at all, so scroll it. The height is
-        // measured from the text the items actually carry - in the mono font a
-        // character count is a width, so a line that wraps is counted as the
-        // rows it really draws - and a popup that fits neither opens a
-        // half-empty panel nor grows a scrollbar it does not need.
-        let spacing = cosmic::theme::spacing();
-        // The widest the popup can be, less this container's padding and the
-        // room a scrollbar takes out of the text.
-        let width = crate::bar::POPUP_MAX_WIDTH - 2.0 * PADDING - SCROLLBAR;
-        let line = |avail: f32| {
-            move |line: &Line| {
-                let size = match line.small {
-                    true => ctx.small(),
-                    false => ctx.font_size,
-                };
-                let wraps = (crate::theme::text_width(&line.text, size) / avail.max(1.0))
-                    .ceil()
-                    .max(1.0);
-                wraps * size * LINE_HEIGHT
+        if !frame.popup.is_empty() {
+            let mut list = crate::popup::column();
+            for item in &frame.popup {
+                list = list.push(match item {
+                    Item::Divider => widget::divider::horizontal::default().into(),
+                    Item::Text(line) => self.line(line, ctx, false),
+                    Item::Row(row) => self.row(row, ctx, false),
+                });
             }
-        };
-        let rows: f32 = frame
-            .popup
-            .iter()
-            .map(|item| match item {
-                Item::Divider => DIVIDER_ROW,
-                Item::Text(text) => line(width)(text),
-                Item::Row(row) => {
-                    // A button steals width from the lines beside it, and
-                    // libcosmic fixes its height at the theme's large spacing
-                    // step whatever the font size, so a one-line row with a
-                    // button is as tall as the button.
-                    let button = row.action.as_ref().map(|action| {
-                        crate::theme::text_width(&action.label, BUTTON_TEXT)
-                            + 2.0 * spacing.space_s as f32
-                    });
-                    let avail = width - button.map_or(0.0, |width| width + ROW_SPACING);
-                    let lines: f32 = row.lines.iter().map(line(avail)).sum();
-                    let floor = match button {
-                        Some(_) => spacing.space_l as f32,
-                        None => ctx.font_size * LINE_HEIGHT,
-                    };
-                    lines.max(floor) + LINE_SPACING * row.lines.len().saturating_sub(1) as f32
-                }
-            })
-            .sum::<f32>()
-            + ITEM_SPACING * frame.popup.len().saturating_sub(1) as f32;
-        Some(
-            widget::scrollable(body)
-                .height(Length::Fixed(rows.min(LIST_HEIGHT)))
-                .apply(widget::container)
-                .padding(PADDING)
-                .into(),
-        )
+            // How long the list is belongs to the extension: the card scrolls
+            // it rather than asking the program to guess what fits.
+            card = card.list(list);
+        }
+        Some(card.build())
     }
 
-    fn line<'a>(&self, line: &'a Line, ctx: &Ctx) -> Element<'a, Message> {
-        let text = crate::theme::text(line.text.as_str())
-            .class(cosmic::theme::Text::Color(line.color.color(&ctx.palette)));
-        match line.small {
-            true => text.size(ctx.small()).into(),
-            false => text.into(),
+    /// One row: its lines stacked on the left, its action on the right. In the
+    /// header the first line is the card's title, which is what makes a
+    /// `header` worth sending instead of a first row.
+    fn row<'a>(&self, row: &'a Row, ctx: &Ctx, header: bool) -> Element<'a, Message> {
+        let mut lines = crate::popup::lines();
+        for (index, line) in row.lines.iter().enumerate() {
+            lines = lines.push(self.line(line, ctx, header && index == 0));
         }
+        let action = row.action.as_ref().map(|action| {
+            let style = match action.danger {
+                true => crate::popup::Chip::Danger,
+                false => crate::popup::Chip::Plain,
+            };
+            crate::popup::chip(
+                action.label.as_str(),
+                style,
+                ctx,
+                action.enabled.then(|| {
+                    Message::Module(ModuleEvent::Extension(
+                        self.index,
+                        Event::Press(action.id.clone()),
+                    ))
+                }),
+            )
+        });
+        crate::popup::split(lines, action).into()
+    }
+
+    fn line<'a>(&self, line: &'a Line, ctx: &Ctx, title: bool) -> Element<'a, Message> {
+        let size = match (title, line.small) {
+            (true, _) => ctx.font_size,
+            (false, true) => ctx.small(),
+            (false, false) => ctx.body(),
+        };
+        crate::theme::text(line.text.as_str())
+            .size(size)
+            .class(cosmic::theme::Text::Color(line.color.color(&ctx.palette)))
+            .into()
     }
 }
 

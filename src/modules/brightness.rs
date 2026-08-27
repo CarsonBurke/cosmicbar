@@ -27,19 +27,17 @@ use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
-use cosmic::iced::{Alignment, Length, Rectangle, Size, Subscription, Vector, mouse};
+use cosmic::iced::{Length, Rectangle, Size, Subscription, Vector, mouse};
 use cosmic::widget;
 use cosmic::{Apply, Element};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar: `@backlight` → base.
 pub const ISLAND: Island = Island::Start;
-
-/// Popup content width; see the note in `power.rs`.
-const POPUP_WIDTH: f32 = 320.0;
 
 /// Scroll step, matching `custom/brightness`'s `up 5` / `down 5`.
 const STEP: u32 = 5;
@@ -246,70 +244,45 @@ impl State {
         if self.displays.is_empty() {
             return None;
         }
-        let mut body = widget::Column::new()
-            .spacing(10)
-            .width(Length::Fixed(POPUP_WIDTH));
-
+        let mut card = Card::new();
         for (index, display) in self.displays.iter().enumerate() {
             let percent = display.found.percent;
-            let mut heading = widget::Row::new()
-                .push(crate::theme::text(glyph(percent)))
-                .push(crate::theme::text(display.found.label.clone()).width(Length::Fill));
-            if let Some(connector) = &display.found.connector {
-                heading = heading.push(
-                    crate::theme::text(connector.clone())
-                        .size(ctx.small())
-                        .class(cosmic::theme::Text::Color(ctx.palette.overlay0)),
-                );
-            }
-            heading = heading.push(
-                crate::theme::text(format!("{percent}%"))
-                    .class(cosmic::theme::Text::Color(ctx.palette.accent())),
-            );
-
-            body = body.push(
-                widget::Column::new()
-                    .push(heading.spacing(8).align_y(Alignment::Center))
-                    .push(
+            let value: Element<'_, Message> = popup::item(format!("{percent}%"), ctx)
+                .class(cosmic::theme::Text::Color(ctx.palette.accent()))
+                .into();
+            card = card.block(
+                popup::column()
+                    .push(popup::section(heading(&display.found), ctx))
+                    .push(popup::split(
                         widget::slider(0..=100, percent, move |percent| {
                             event_message(Event::Set(Target::One(index), percent))
                         })
                         .step(1u32),
+                        [value],
+                    )),
+            );
+        }
+
+        // The presets move every display at once, which is what makes them the
+        // card's footer rather than a control inside one display's block.
+        Some(
+            card.block(popup::split(
+                popup::detail("all", ctx),
+                PRESETS.map(|preset| {
+                    popup::chip(
+                        format!("{preset}%"),
+                        Chip::Plain,
+                        ctx,
+                        Some(event_message(Event::Set(Target::All, preset))),
                     )
-                    .spacing(4)
-                    .width(Length::Fill),
-            );
-        }
-
-        let mut presets = widget::Row::new()
-            .push(
-                crate::theme::text("all")
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(ctx.palette.muted())),
-            )
-            .spacing(6)
-            .align_y(Alignment::Center);
-        for preset in PRESETS {
-            presets = presets.push(
-                widget::button::custom(crate::theme::text(format!("{preset}%")))
-                    .padding([4, 8])
-                    .class(crate::theme::chip(ctx.palette))
-                    .on_press(event_message(Event::Set(Target::All, preset))),
-            );
-        }
-        body = body
-            .push(widget::divider::horizontal::default())
-            .push(presets);
-
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(ctx.palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+                }),
+            ))
+            .maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx)
+                    .class(cosmic::theme::Text::Color(ctx.palette.red))
+            }))
+            .build(),
+        )
     }
 
     pub fn fast_tick(&self, _open: bool) -> bool {
@@ -405,6 +378,17 @@ impl State {
 
 fn event_message(event: Event) -> Message {
     Message::Module(ModuleEvent::Brightness(event))
+}
+
+/// How a display introduces itself. The connector leads when the backend knows
+/// one, because `DP-1` is what the compositor and this bar's own per-output
+/// cells call that monitor, and the model beside it is what is printed on the
+/// bezel in front of the user.
+fn heading(found: &Found) -> String {
+    match &found.connector {
+        Some(connector) => format!("{connector} · {}", found.label),
+        None => found.label.clone(),
+    }
 }
 
 /// waybar's script picked its icon from an average; the thresholds are the same,

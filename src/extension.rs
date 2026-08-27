@@ -17,6 +17,11 @@
 //! ext  -> {"cell":...,"popup":[...]}        the answer is the next frame
 //! ```
 //!
+//! A frame's `header` is the one part of a popup that does not scroll: what the
+//! popup is and the verb that acts on all of it — a queue and its pause, an
+//! adapter and its switch — belong there rather than at the bottom of a list
+//! that walks away from them.
+//!
 //! The protocol is a drawing contract, not a widget toolkit: colours are palette
 //! roles rather than hex, so an extension inherits the bar's theme, and the only
 //! interactive element is a labelled button on a popup row. `contrib/extensions`
@@ -51,6 +56,11 @@ pub struct Frame {
     /// takes no bar space, the way the built-in modules do.
     #[serde(default)]
     pub cell: Option<Cell>,
+    /// The popup's header: its title, the state under it, and the action that
+    /// applies to the whole thing. Drawn above the list and pinned there, so a
+    /// hundred rows cannot scroll it away.
+    #[serde(default)]
+    pub header: Option<Row>,
     /// Popup body, top to bottom. Empty means the cell is not clickable.
     #[serde(default)]
     pub popup: Vec<Item>,

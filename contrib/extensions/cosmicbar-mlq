@@ -2,8 +2,9 @@
 """cosmicbar extension: what the machine is training right now.
 
 Subscribes to mlqd (the mlqueue daemon) over its unix socket and draws a bar
-cell plus a popup with one row per live job, a cancel button on each, and a
-pause switch in the footer.
+cell plus a popup: a pinned header saying what the queue is doing with the
+pause switch beside it, and under it one scrolling row per live job with a
+cancel button on each.
 
 This is the worked example for the extension protocol: it is push-driven
 (mlqd's `subscribe` op streams snapshots, so nothing here polls the queue), it
@@ -219,14 +220,45 @@ class Extension:
             }
         return None
 
+    def header(self, status: dict) -> dict:
+        """The card's header: what the queue is doing, and the pause beside it.
+
+        The bar pins this above the list, so the state of the queue and the one
+        verb that acts on all of it stay on screen however many jobs are in it.
+        """
+        active = running(status)
+        pending = [job for job in live(status) if job.get("state") != "running"]
+        paused = bool(status.get("paused"))
+        if active:
+            headline = f"{len(active)} running"
+        elif pending:
+            headline = f"{len(pending)} queued"
+        else:
+            headline = "queue empty"
+
+        limit = status.get("effectiveLimit")
+        leases = status.get("activeLeases", 0)
+        detail = f"{leases}/{limit} leases" if limit is not None else f"{leases} leases"
+        if paused:
+            detail += " · paused"
+        if not self.connected:
+            detail += " · reconnecting"
+        return {
+            "lines": [
+                {"text": headline, "color": "peach" if paused else "fg"},
+                {"text": detail, "color": "muted", "small": True},
+            ],
+            "action": {
+                "id": "unpause" if paused else "pause",
+                "label": "unpause" if paused else "pause",
+            },
+        }
+
     def popup(self, status: dict) -> list[dict]:
         now_ms = int(time.time() * 1000)
         items: list[dict] = []
 
-        jobs = live(status)
-        if not jobs:
-            items.append({"text": {"text": "queue empty", "color": "muted"}})
-        for job in jobs:
+        for job in live(status):
             if job.get("state") == "running":
                 state = f"running \u00b7 {duration(self.elapsed_ms(job, now_ms))}"
                 color = "green"
@@ -234,6 +266,8 @@ class Extension:
                 state = job.get("eligibility") or job.get("state", "?")
                 color = "muted"
             cancelling = bool(job.get("cancelRequested"))
+            # A unit item is a bare string; everything else is a single-key
+            # object.
             items.append(
                 {
                     "row": {
@@ -251,28 +285,6 @@ class Extension:
                     }
                 }
             )
-
-        limit = status.get("effectiveLimit")
-        leases = status.get("activeLeases", 0)
-        summary = f"{leases}/{limit} leases" if limit is not None else f"{leases} leases"
-        paused = bool(status.get("paused"))
-        # A unit item is a bare string; everything else is a single-key object.
-        items.append("divider")
-        items.append(
-            {
-                "row": {
-                    "lines": [{"text": summary, "color": "muted", "small": True}],
-                    "action": {
-                        "id": "unpause" if paused else "pause",
-                        "label": "unpause" if paused else "pause",
-                    },
-                }
-            }
-        )
-        if not self.connected:
-            items.append(
-                {"text": {"text": "reconnecting to mlqd\u2026", "color": "peach", "small": True}}
-            )
         if self.error:
             items.append({"text": {"text": self.error, "color": "red", "small": True}})
         return items
@@ -289,7 +301,11 @@ class Extension:
             body = (
                 {"cell": None, "popup": []}
                 if status is None
-                else {"cell": self.cell(status), "popup": self.popup(status)}
+                else {
+                    "cell": self.cell(status),
+                    "header": self.header(status),
+                    "popup": self.popup(status),
+                }
             )
             frame = json.dumps(body, separators=(",", ":"))
             if frame == self.last:

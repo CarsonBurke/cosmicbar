@@ -6,7 +6,7 @@ a fifth of that cell wide. The bar subtracts a glyph's own side bearings from th
 gap it puts next to text, so the ink-to-text distance is the same in every
 module; those bearings are what this script measures.
 
-Run it after changing `theme::font` or adding a glyph constant:
+Run it after changing `theme::icon_font` or adding a glyph constant:
 
     python3 contrib/glyph-bearings.py
 
@@ -23,7 +23,7 @@ import sys
 from fontTools.pens.boundsPen import BoundsPen
 from fontTools.ttLib import TTFont
 
-#: Must match the family in `theme::font`.
+#: Must match the family in `theme::icon_font`.
 FONT = "/usr/share/fonts/OTF/CommitMonoNerdFontMono-Regular.otf"
 FAMILY = "CommitMono Nerd Font Mono"
 #: Below this the bearing is under a fifth of a pixel at the bar's font size.
@@ -40,8 +40,8 @@ HEADER = f'''//! Side bearings of the nerd-font glyphs the bar draws, in em.
 //! different gap per module. Subtracting the glyph's own right bearing from that
 //! gap makes the ink-to-text distance the same everywhere.
 //!
-//! Generated from `{FAMILY}` (the family in `theme::font`) by
-//! `contrib/glyph-bearings.py`; rerun it after changing the font or a glyph
+//! Generated from `{FAMILY}` (the family in `theme::icon_font`) by
+//! `contrib/glyph-bearings.py`; rerun it after changing the icon font or a glyph
 //! constant.
 
 /// `(codepoint, left bearing, right bearing)`, sorted by codepoint. Glyphs whose

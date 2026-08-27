@@ -55,8 +55,8 @@ cargo install --path .            # ~/.cargo/bin/cosmicbar
 ```
 
 Rust 1.93+, a Wayland session, and `libpulse` and `libxkbcommon` at build time;
-libcosmic itself is fetched from git. Module glyphs need a Nerd Font
-(`CommitMono Nerd Font Mono` by default).
+libcosmic itself is fetched from git. The bar inherits the system interface font
+for text and uses `CommitMono Nerd Font Mono` for Nerd Font icons.
 
 Start it from your compositor:
 

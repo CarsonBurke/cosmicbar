@@ -21,12 +21,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::channel::mpsc::{UnboundedSender, unbounded};
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Length, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
 
 use zbus::message::Message as BusMessage;
 use zbus::names::BusName;
@@ -35,6 +35,7 @@ use zbus::{Connection, MatchRule, MessageStream, Proxy};
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
+use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
 
 /// waybar gave `#mpris` padding only, so it sits on the bar background.
@@ -306,52 +307,41 @@ impl State {
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let player = self.current()?;
         let palette = ctx.palette;
-        let mut body = widget::Column::new().spacing(6).width(Length::Fill);
+        let mut card = Card::new();
 
+        // Which player everything below is about has to be settled before any
+        // of it means anything, so the picker sits above the track rather than
+        // beside it.
         if self.players.len() > 1 {
-            let mut picker = widget::Row::new().spacing(4);
+            let mut picker = widget::Row::new().spacing(popup::ROW_GAP);
             for other in self.players.iter() {
-                let chosen = other.bus == player.bus;
-                picker = picker.push(
-                    widget::button::custom(
-                        crate::theme::text(format!("{} {}", other.glyph(), elide(&other.identity, 14)))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(if chosen {
-                                palette.accent()
-                            } else {
-                                palette.muted()
-                            })),
-                    )
-                    .padding([2, 8])
-                    .class(crate::theme::module_button(palette, palette.base, [8.0; 4]))
-                    .on_press(event_message(Event::Select(other.bus.clone()))),
-                );
+                picker = picker.push(popup::chip(
+                    elide(&other.identity, 14),
+                    match other.bus == player.bus {
+                        true => Chip::Accent,
+                        false => Chip::Plain,
+                    },
+                    ctx,
+                    Some(event_message(Event::Select(other.bus.clone()))),
+                ));
             }
-            body = body.push(picker).push(widget::divider::horizontal::default());
+            card = card.block(picker);
         }
 
-        body = body.push(
-            crate::theme::text(if player.title.is_empty() {
-                player.identity.clone()
-            } else {
-                player.title.clone()
-            })
-            .class(cosmic::theme::Text::Color(palette.fg())),
-        );
+        let mut track = popup::lines().push(popup::title(
+            match player.title.is_empty() {
+                true => player.identity.as_str(),
+                false => player.title.as_str(),
+            },
+            ctx,
+        ));
         if !player.artist.is_empty() {
-            body = body.push(
-                crate::theme::text(player.artist.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
+            track = track.push(popup::detail(player.artist.as_str(), ctx));
         }
         if !player.album.is_empty() {
-            body = body.push(
-                crate::theme::text(player.album.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.overlay0)),
-            );
+            track = track.push(popup::detail(player.album.as_str(), ctx));
         }
+        card = card.block(track);
 
         let played = player.elapsed_us(ctx.now_ms);
         if player.length_us > 0 {
@@ -362,7 +352,7 @@ impl State {
                 Some(seconds) => seconds.min(total),
                 None => (played / 1_000_000).clamp(0, total as i64) as u32,
             };
-            body = body.push(if player.can_seek {
+            let seek: Element<'_, Message> = if player.can_seek {
                 widget::slider(0..=total, at, |seconds| {
                     event_message(Event::Scrub(seconds))
                 })
@@ -371,93 +361,86 @@ impl State {
                 .width(Length::Fill)
                 .into()
             } else {
-                Element::from(
-                    widget::progress_bar::determinate_linear(at as f32 / total as f32)
-                        .width(Length::Fill),
-                )
-            });
-            body = body.push(
-                widget::Row::new()
-                    .push(
-                        crate::theme::text(clock(i64::from(at) * 1_000_000))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(match self.scrub {
-                                Some(_) => palette.accent(),
-                                None => palette.muted(),
-                            }))
-                            .width(Length::Fill),
-                    )
-                    .push(
-                        crate::theme::text(clock(player.length_us))
-                            .size(ctx.small())
-                            .class(cosmic::theme::Text::Color(palette.muted())),
-                    )
-                    .align_y(Alignment::Center),
-            );
+                widget::progress_bar::determinate_linear(at as f32 / total as f32)
+                    .width(Length::Fill)
+                    .into()
+            };
+            let elapsed = popup::detail(clock(i64::from(at) * 1_000_000), ctx);
+            card = card.block(popup::column().push(seek).push(popup::split(
+                match self.scrub {
+                    Some(_) => elapsed.class(cosmic::theme::Text::Color(palette.accent())),
+                    None => elapsed,
+                },
+                [popup::detail(clock(player.length_us), ctx).into()],
+            )));
         } else if played > 0 {
-            body = body.push(
-                crate::theme::text(clock(played))
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.muted())),
-            );
+            card = card.block(popup::detail(clock(played), ctx));
         }
 
         let playing = player.status == Status::Playing;
-        let mut transport = widget::Row::new().spacing(4).align_y(Alignment::Center);
-        transport = transport
+        let transport = widget::Row::new()
+            .spacing(popup::ROW_GAP)
             .push(control(
                 ctx,
                 PREVIOUS,
-                palette.fg(),
+                Chip::Plain,
                 player.can_previous.then_some(Action::Previous),
             ))
             .push(control(
                 ctx,
                 if playing { PAUSE } else { PLAY },
-                palette.accent(),
+                Chip::Accent,
                 // A player that can neither pause nor play has no transport.
                 (player.can_pause || player.can_play).then_some(Action::PlayPause),
             ))
             .push(control(
                 ctx,
                 NEXT,
-                palette.fg(),
+                Chip::Plain,
                 player.can_next.then_some(Action::Next),
             ))
             .push(control(
                 ctx,
                 STOP,
-                palette.fg(),
+                Chip::Plain,
                 (player.status != Status::Stopped).then_some(Action::Stop),
-            ))
-            .push(widget::space::horizontal());
+            ));
+
+        // Shuffle and loop are states rather than verbs, so they sit where a
+        // block's actions sit and light up when they are on.
+        let mut modes: Vec<Element<'_, Message>> = Vec::new();
         if let Some(shuffle) = player.shuffle {
-            transport = transport.push(control(
+            modes.push(control(
                 ctx,
                 if shuffle { SHUFFLE } else { SHUFFLE_OFF },
-                if shuffle { palette.accent() } else { palette.overlay0 },
+                match shuffle {
+                    true => Chip::Accent,
+                    false => Chip::Plain,
+                },
                 Some(Action::Shuffle(!shuffle)),
             ));
         }
         if let Some(mode) = player.loop_status.as_deref() {
-            let (glyph, color) = match mode {
-                "Track" => (REPEAT_ONCE, palette.accent()),
-                "Playlist" => (REPEAT, palette.accent()),
-                _ => (REPEAT_OFF, palette.overlay0),
+            let (glyph, style) = match mode {
+                "Track" => (REPEAT_ONCE, Chip::Accent),
+                "Playlist" => (REPEAT, Chip::Accent),
+                _ => (REPEAT_OFF, Chip::Plain),
             };
-            transport = transport.push(control(ctx, glyph, color, Some(Action::Loop(next_loop(mode)))));
+            modes.push(control(
+                ctx,
+                glyph,
+                style,
+                Some(Action::Loop(next_loop(mode))),
+            ));
         }
-        body = body.push(transport);
+        card = card.block(popup::split(transport, modes));
 
-        if let Some(error) = &self.error {
-            body = body.push(
-                crate::theme::text(error.clone())
-                    .size(ctx.small())
-                    .class(cosmic::theme::Text::Color(palette.red)),
-            );
-        }
-
-        Some(body.apply(widget::container).padding(12).into())
+        Some(
+            card.maybe(self.error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .build(),
+        )
     }
 
     /// The player the bar speaks for: the pinned one, else the one that is
@@ -485,25 +468,20 @@ fn event_message(event: Event) -> Message {
     Message::Module(ModuleEvent::Mpris(event))
 }
 
-/// One transport button, greyed out when the player says it cannot.
+/// One transport button, drawn dead when the player says it cannot: the
+/// affordance staying put is what tells you the player is the limit.
 fn control<'a>(
     ctx: &Ctx,
     glyph: &'a str,
-    color: cosmic::iced::Color,
+    style: Chip,
     action: Option<Action>,
 ) -> Element<'a, Message> {
-    let enabled = action.is_some();
-    widget::button::custom(
-        crate::theme::text(glyph).class(cosmic::theme::Text::Color(if enabled {
-            color
-        } else {
-            ctx.palette.surface1
-        })),
+    popup::icon_chip(
+        glyph,
+        style,
+        ctx,
+        action.map(|action| event_message(Event::Dispatch(action))),
     )
-    .padding([2, 8])
-    .class(crate::theme::module_button(ctx.palette, ctx.palette.base, [8.0; 4]))
-    .on_press_maybe(action.map(|action| event_message(Event::Dispatch(action))))
-    .into()
 }
 
 /// MPRIS cycles `None` -> `Playlist` -> `Track`, which is the order players

@@ -1,29 +1,27 @@
 //! Power menu, replacing `scripts/power-menu.sh` (an fzf list in a spawned
 //! kitty) with a popup of real buttons.
 //!
-//! Everything goes through logind on D-Bus instead of `systemctl`/`loginctl`
-//! subprocesses, log out goes through niri's IPC, and the three destructive
-//! entries need a second, confirming click in place — a stray click on the bar
-//! can no longer power the machine off.
+//! Everything goes through logind on D-Bus instead of `systemctl`/`loginctl`,
+//! and log out goes through niri's IPC. Choosing an available action executes
+//! it directly; the menu itself is the deliberate interaction boundary.
 //!
 //! logind exposes no signal for `CanPowerOff`/`CanHibernate`, so capabilities
 //! are queried while the popup is open (see [`State::subscription`]) and
 //! refreshed on a slow timer; a machine that gains or loses swap is rare.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cosmic::Element;
 use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
 use cosmic::iced::{Alignment, Subscription};
-use cosmic::widget;
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
-use crate::popup::{self, Card, Chip};
+use crate::popup::{self, Card};
 use crate::theme::Island;
 
-/// waybar: no island, `color: @accent`.
+/// A flat system-foreground control, matching the launcher at the other edge.
 pub const ISLAND: Island = Island::Flat;
 
 /// nf-md-power. Waybar used nf-md-power-sleep (a crescent moon), which now
@@ -31,13 +29,6 @@ pub const ISLAND: Island = Island::Flat;
 /// power symbol, because that is what the menu is.
 const ICON: &str = "\u{f0425}";
 
-/// How long an armed confirmation stays armed. Long enough to read the
-/// question, short enough that a popup reopened later is never pre-armed.
-const ARM_TIMEOUT: Duration = Duration::from_secs(8);
-/// A confirming click is only accepted after this long, so a double click —
-/// the realistic accident — arms and re-arms instead of firing, whatever the
-/// popup happens to have painted by then.
-const CONFIRM_DELAY: Duration = Duration::from_millis(400);
 /// Capability re-query interval while the popup is open.
 const CAPABILITY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -86,15 +77,6 @@ impl Action {
         }
     }
 
-    /// The question asked before an action that destroys running work.
-    fn confirmation(self) -> Option<&'static str> {
-        match self {
-            Self::LogOut => Some("Really log out?"),
-            Self::Reboot => Some("Really reboot?"),
-            Self::PowerOff => Some("Really power off?"),
-            Self::Lock | Self::Suspend | Self::Hibernate => None,
-        }
-    }
 }
 
 /// logind's `Can*` answer.
@@ -152,10 +134,6 @@ pub struct Capabilities {
 #[derive(Debug, Clone)]
 pub enum Event {
     Capabilities(Capabilities),
-    /// First click on a destructive entry: ask the question.
-    Arm(Action),
-    Disarm,
-    /// Do it.
     Fire(Action),
     Done(Result<(), String>),
 }
@@ -163,8 +141,6 @@ pub enum Event {
 #[derive(Debug, Default)]
 pub struct State {
     capabilities: Capabilities,
-    armed: Option<(Action, Instant)>,
-    busy: bool,
     error: Option<String>,
 }
 
@@ -185,18 +161,8 @@ impl State {
                 self.capabilities = capabilities;
                 Task::none()
             }
-            Event::Arm(action) => {
-                self.armed = Some((action, Instant::now()));
-                self.error = None;
-                Task::none()
-            }
-            Event::Disarm => {
-                self.armed = None;
-                Task::none()
-            }
             Event::Fire(action) => {
-                self.armed = None;
-                self.busy = true;
+                self.error = None;
                 let interactive = self.capability(action).interactive();
                 Task::batch([
                     // Leaving the menu open over a suspend or a shutdown would
@@ -212,7 +178,6 @@ impl State {
                 ])
             }
             Event::Done(result) => {
-                self.busy = false;
                 if let Err(error) = &result {
                     log::warn!("power action failed: {error}");
                 }
@@ -226,7 +191,7 @@ impl State {
         let color = if self.error.is_some() {
             ctx.palette.red
         } else {
-            ctx.palette.accent()
+            ctx.palette.fg()
         };
         Some(
             crate::theme::glyph_only(ICON, ctx.font_size)
@@ -248,73 +213,29 @@ impl State {
 
         for action in Action::MENU {
             let capability = self.capability(action);
-            let armed = self.armed_for(action);
-            let confirmation = action.confirmation();
             let usable = capability.usable();
-
-            let message = match (armed, confirmation.is_some()) {
-                // First click on a destructive entry only asks.
-                (false, true) => Event::Arm(action),
-                _ => Event::Fire(action),
-            };
-            let on_press = usable.then(|| event_message(message));
-
-            let entry: Element<'_, Message> = match (armed, confirmation) {
-                (true, Some(question)) => popup::split(
-                    popup::row_armed(
-                        widget::Row::new()
-                            .push(crate::theme::glyph_text(action.glyph(), ctx.body()))
-                            .push(
-                                popup::lines()
-                                    .push(popup::item(question, ctx))
-                                    // An armed row hands its text the
-                                    // destructive button's own dark ink; the
-                                    // muted grey a detail carries everywhere
-                                    // else is unreadable on top of it.
-                                    .push(
-                                        popup::detail("click again to confirm", ctx)
-                                            .class(cosmic::theme::Text::Default),
-                                    ),
-                            )
-                            .spacing(crate::theme::GLYPH_GAP)
-                            .align_y(Alignment::Center),
-                        palette,
-                        on_press,
+            let note: Option<Element<'_, Message>> = capability
+                .note()
+                .map(|note| popup::detail(note, ctx).into());
+            menu = menu.push(popup::row(
+                popup::split(
+                    crate::theme::label(
+                        action.glyph(),
+                        action.label(),
+                        ctx.body(),
+                        // An action the system cannot do reads as dimmed, which
+                        // the label has to carry itself: the row's own text
+                        // colour never reaches it.
+                        cosmic::theme::Text::Color(match usable {
+                            true => palette.fg(),
+                            false => palette.muted(),
+                        }),
                     ),
-                    [popup::chip(
-                        "cancel",
-                        Chip::Plain,
-                        ctx,
-                        Some(event_message(Event::Disarm)),
-                    )],
-                )
-                .into(),
-                _ => {
-                    let note: Option<Element<'_, Message>> = capability
-                        .note()
-                        .map(|note| popup::detail(note, ctx).into());
-                    popup::row(
-                        popup::split(
-                            crate::theme::label(
-                                action.glyph(),
-                                action.label(),
-                                ctx.body(),
-                                // An action the system cannot do reads as
-                                // dimmed, which the label has to carry itself:
-                                // the row's own text colour never reaches it.
-                                cosmic::theme::Text::Color(match usable {
-                                    true => palette.fg(),
-                                    false => palette.muted(),
-                                }),
-                            ),
-                            note,
-                        ),
-                        palette,
-                        on_press,
-                    )
-                }
-            };
-            menu = menu.push(entry);
+                    note,
+                ),
+                palette,
+                usable.then(|| event_message(Event::Fire(action))),
+            ));
         }
 
         Some(
@@ -328,11 +249,8 @@ impl State {
         )
     }
 
-    /// Ticking while armed is what lets the confirmation expire on its own,
-    /// without a timer that could fire after the popup closed.
     pub fn fast_tick(&self, _open: bool) -> bool {
-        self.armed
-            .is_some_and(|(_, at)| at.elapsed() < ARM_TIMEOUT)
+        false
     }
 
     fn capability(&self, action: Action) -> Capability {
@@ -346,12 +264,6 @@ impl State {
         }
     }
 
-    /// Is this entry showing its question *and* old enough to act on?
-    fn armed_for(&self, action: Action) -> bool {
-        self.armed.is_some_and(|(armed, at)| {
-            armed == action && (CONFIRM_DELAY..ARM_TIMEOUT).contains(&at.elapsed())
-        })
-    }
 }
 
 fn event_message(event: Event) -> Message {
@@ -410,13 +322,13 @@ async fn fire(action: Action, interactive: bool) -> anyhow::Result<()> {
     }
 }
 
-/// niri asks for its own Enter-to-confirm before it exits, so log out keeps a
-/// second safety net beyond the bar's confirmation click.
+/// Log out immediately once its menu row is chosen, matching the other power
+/// actions.
 async fn quit_niri() -> anyhow::Result<()> {
     tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
         let mut socket = niri_ipc::socket::Socket::connect()?;
         let reply = socket.send(niri_ipc::Request::Action(niri_ipc::Action::Quit {
-            skip_confirmation: false,
+            skip_confirmation: true,
         }))?;
         reply.map_err(|message| anyhow::anyhow!("niri: {message}"))?;
         Ok(())

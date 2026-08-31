@@ -1,9 +1,9 @@
-//! Palette and widget styling.
+//! System-derived palette and widget styling.
 //!
-//! The bar carries its own theme: outside a COSMIC session there is no
-//! cosmic-settings-daemon to read, and the look has to match the existing
-//! Catppuccin Mocha waybar. Semantic names mirror the ones the waybar CSS
-//! used (`main-bg`, `accent`, `warning`, ...) so the two bars are comparable.
+//! COSMIC owns the color preference. The default palette projects its semantic
+//! roles into the compact bar vocabulary below, so custom widgets, stock
+//! libcosmic controls, and applet popups all react to the same light/dark and
+//! accent settings. Catppuccin remains available as an explicit override.
 
 use cosmic::iced::font::{Family, Weight};
 use cosmic::iced::{Background, Border, Color, Font, Shadow};
@@ -89,8 +89,35 @@ impl Palette {
 
     pub fn by_name(name: &str) -> Self {
         match name {
+            "catppuccin-mocha" | "mocha" => Self::MOCHA,
             "catppuccin-latte" | "latte" => Self::LATTE,
-            _ => Self::MOCHA,
+            _ => Self::system(),
+        }
+    }
+
+    fn system() -> Self {
+        let theme = cosmic::theme::active();
+        let cosmic = theme.cosmic();
+        let background = cosmic.background(theme.transparent);
+        let colors = &cosmic.palette;
+
+        Self {
+            crust: background.base.into(),
+            mantle: background.component.base.into(),
+            base: background.base.into(),
+            surface0: background.component.hover.into(),
+            surface1: background.divider.into(),
+            text: background.on.into(),
+            subtext0: background.component.on.into(),
+            overlay0: background.component.on_disabled.into(),
+            lavender: cosmic.accent.base.into(),
+            blue: colors.accent_blue.into(),
+            green: colors.bright_green.into(),
+            yellow: colors.accent_yellow.into(),
+            peach: colors.bright_orange.into(),
+            red: colors.bright_red.into(),
+            mauve: colors.accent_purple.into(),
+            teal: colors.accent_green.into(),
         }
     }
 
@@ -196,11 +223,11 @@ pub fn island(palette: Palette, island: Island) -> cosmic::theme::Container<'sta
 
 /// Popup surface style: a raised card with an accent-free 1px border.
 pub fn popup(palette: Palette) -> cosmic::theme::Container<'static> {
-    cosmic::theme::Container::custom(move |_theme| container::Style {
+    cosmic::theme::Container::custom(move |theme| container::Style {
         text_color: Some(palette.fg()),
         background: Some(Background::Color(palette.base)),
         border: Border {
-            radius: 12.0.into(),
+            radius: theme.cosmic().corner_radii.radius_m.into(),
             width: 1.0,
             color: palette.surface1,
         },

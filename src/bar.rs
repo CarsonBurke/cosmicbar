@@ -11,7 +11,9 @@ use cosmic::iced::event::{self, listen_with};
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     destroy_layer_surface, get_layer_surface,
 };
-use cosmic::iced::platform_specific::shell::commands::popup::{destroy_popup, get_popup};
+use cosmic::iced::platform_specific::shell::commands::popup::{
+    destroy_popup, get_popup, reposition,
+};
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedOutput, SctkLayerSurfaceSettings,
 };
@@ -108,6 +110,8 @@ struct Popup {
     id: SurfaceId,
     parent: SurfaceId,
     module: ModuleId,
+    /// Last compositor-confirmed geometry, required by xdg-popup reposition.
+    size: (u32, u32),
 }
 
 pub struct Bar {
@@ -183,6 +187,15 @@ impl cosmic::Application for Bar {
                 // The compositor already destroyed it; only our state is stale.
                 if self.popup.as_ref().is_some_and(|popup| popup.id == id) {
                     self.popup = None;
+                }
+                Task::none()
+            }
+            Message::PopupEvent(
+                cosmic::iced::event::wayland::PopupEvent::Configured { width, height, .. },
+                id,
+            ) => {
+                if let Some(popup) = self.popup.as_mut().filter(|popup| popup.id == id) {
+                    popup.size = (width, height);
                 }
                 Task::none()
             }
@@ -434,13 +447,8 @@ impl Bar {
             .popup
             .as_ref()
             .is_some_and(|popup| popup.module == module && popup.parent == parent);
-        let closing = self.popup.is_some();
-        let close = self.close_popup();
-        if already_open {
-            return close;
-        }
-        if !self.modules.has_popup(module) {
-            return close;
+        if already_open || !self.modules.has_popup(module) {
+            return self.close_popup();
         }
 
         let anchor = self
@@ -453,50 +461,48 @@ impl Bar {
                 width: 1.0,
                 height: self.config.height as f32,
             });
+        let size = self.popup.as_ref().map_or((360, 240), |popup| popup.size);
+        let positioner = popup_positioner(anchor, size);
+
+        // Keep the grabbing xdg-popup alive while moving between cells on the
+        // same bar. Destroying it and creating a replacement in one update races
+        // the compositor's `popup_done` and can consume the click without ever
+        // mapping the replacement. Reposition is the protocol operation made
+        // for this case; it also preserves the grab and lets the content
+        // transition without flashing a second surface.
+        if let Some(popup) = self.popup.as_mut().filter(|popup| popup.parent == parent) {
+            popup.module = module;
+            return reposition(popup.id, positioner);
+        }
+
+        let previous = self.popup.take();
         let id = SurfaceId::unique();
-        self.popup = Some(Popup { id, parent, module });
+        self.popup = Some(Popup {
+            id,
+            parent,
+            module,
+            size: (360, 240),
+        });
         log::debug!(
             "opening popup {id:?} for {} on {parent:?}, anchor {anchor:?}, grab={grab}",
             module.name()
         );
 
         let open = get_popup(SctkPopupSettings {
-                parent,
-                id,
-                positioner: SctkPositioner {
-                    size: Some((360, 240)),
-                    size_limits: Limits::NONE
-                        .min_width(POPUP_MIN_WIDTH)
-                        .min_height(1.0)
-                        .max_width(POPUP_MAX_WIDTH)
-                        .max_height(POPUP_MAX_HEIGHT),
-                    anchor_rect: Rectangle {
-                        x: anchor.x.round() as i32,
-                        y: anchor.y.round() as i32,
-                        width: anchor.width.round().max(1.0) as i32,
-                        height: anchor.height.round().max(1.0) as i32,
-                    },
-                    anchor: cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::Anchor::Bottom,
-                    gravity: cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::Gravity::Bottom,
-                    // slide_x | slide_y | flip_x | flip_y
-                    constraint_adjustment: 15,
-                    offset: (0, 4),
-                    reactive: true,
-                },
-                parent_size: None,
-                // A pointer-driven popup grabs so a click elsewhere dismisses
-                // it; a keybind-driven one has no serial to grab with.
-                grab,
-                close_with_children: true,
-                input_zone: None,
+            parent,
+            id,
+            positioner,
+            parent_size: None,
+            // A pointer-driven popup grabs so a click elsewhere dismisses it;
+            // a keybind-driven one has no serial to grab with.
+            grab,
+            close_with_children: true,
+            input_zone: None,
         });
 
-        // Only batch when a different popup actually had to be torn down: an
-        // extra `Task::none()` in the batch is harmless, but keeping the open
-        // request alone in the common case makes the effect ordering obvious.
-        match closing {
-            true => Task::batch([close, open]),
-            false => open,
+        match previous {
+            Some(previous) => destroy_popup(previous.id).chain(open),
+            None => open,
         }
     }
 
@@ -515,9 +521,12 @@ impl Bar {
         let content = content.unwrap_or_else(|| widget::text("").into());
 
         autosize::autosize(
-            crate::hover::guard(content)
-                .apply(widget::container)
-                .class(crate::theme::popup(ctx.palette)),
+            crate::popup::transition(
+                crate::hover::guard(content)
+                    .apply(widget::container)
+                    .class(crate::theme::popup(ctx.palette)),
+                popup.module,
+            ),
             AUTOSIZE_ID.clone(),
         )
         .limits(
@@ -744,6 +753,29 @@ impl Bar {
                 island.unwrap_or(crate::theme::Island::Flat),
             ))
             .into()
+    }
+}
+
+fn popup_positioner(anchor: Rectangle, size: (u32, u32)) -> SctkPositioner {
+    SctkPositioner {
+        size: Some(size),
+        size_limits: Limits::NONE
+            .min_width(POPUP_MIN_WIDTH)
+            .min_height(1.0)
+            .max_width(POPUP_MAX_WIDTH)
+            .max_height(POPUP_MAX_HEIGHT),
+        anchor_rect: Rectangle {
+            x: anchor.x.round() as i32,
+            y: anchor.y.round() as i32,
+            width: anchor.width.round().max(1.0) as i32,
+            height: anchor.height.round().max(1.0) as i32,
+        },
+        anchor: cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::Anchor::Bottom,
+        gravity: cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::Gravity::Bottom,
+        // slide_x | slide_y | flip_x | flip_y
+        constraint_adjustment: 15,
+        offset: (0, 4),
+        reactive: true,
     }
 }
 

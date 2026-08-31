@@ -78,7 +78,7 @@ than ignored, and the bar logs and runs on defaults.
 height = 24
 font_size = 16.0
 font_weight_bold = true
-palette = "catppuccin-mocha"   # or catppuccin-latte
+palette = "system"             # or catppuccin-mocha / catppuccin-latte
 terminal = "kitty"
 overlay_layer = false          # true to draw over fullscreen windows
 outputs = []                   # empty = every monitor
@@ -105,7 +105,7 @@ Placing a module is what starts its subscription; leaving it out costs nothing.
 | `bluetooth` | connected count and battery, scan, connect | BlueZ |
 | `volume` | sink and source levels, device switching | libpulse |
 | `mpris` | what is playing, working transport | MPRIS2 signals |
-| `notifications` | do-not-disturb toggle, notification list | mako's D-Bus interface |
+| `notifications` | rich notification list with inline local images and do-not-disturb | mako's D-Bus interface |
 | `tray` | tray icons with real menus | StatusNotifierItem host |
 | `updates` | pending packages, upgrade in a terminal | `checkupdates` |
 | `battery` | charge and time left, peripherals too | UPower |

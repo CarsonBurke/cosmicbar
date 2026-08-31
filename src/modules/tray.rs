@@ -16,6 +16,7 @@
 //! right click opens the item's `DBusMenu` in the bar's popup — and the popup
 //! keeps a selector row, so one popup can walk every item's menu.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -62,6 +63,9 @@ const SUBMENU_CLOSED: &str = "\u{f0142}";
 const ICON_FRACTION: f32 = 0.56;
 /// Indent per submenu level, in logical pixels.
 const MENU_INDENT: f32 = 14.0;
+/// Keep a multi-item picker compact even when an application publishes a
+/// sentence (or a reverse-DNS identifier) as its title.
+const SELECTOR_LABEL_CHARS: usize = 18;
 
 /// Reconnect ladder for a session bus that is down or restarting.
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
@@ -227,6 +231,15 @@ impl State {
             Event::Secondary(address) => self.item_call(address, ItemCall::Secondary),
             Event::OpenMenu(address) => self.open_menu(address),
             Event::Select(address) => {
+                // The active selector stays pressable so its accent style is
+                // not replaced by iced's disabled style. Treating that styling
+                // click as a real selection would collapse open submenus.
+                if self
+                    .target()
+                    .is_some_and(|item| item.address == address)
+                {
+                    return Task::none();
+                }
                 self.expanded.clear();
                 self.selected = Some(address.clone());
                 self.about_to_show(address, 0)
@@ -291,23 +304,26 @@ impl State {
         let item = self.target()?;
         let mut card = Card::new();
 
-        // One popup walks every item's menu, so it has to say whose menu is on
-        // screen and offer the others.
+        // One popup walks every item's menu, so settle the active item before
+        // rendering any item-specific content. Keeping every chip enabled is
+        // intentional: iced's disabled styling would otherwise mute the
+        // accent on the current item and make the selection ambiguous.
         if self.items.len() > 1 {
             let mut selector = widget::Row::new().spacing(popup::ROW_GAP);
             for candidate in &self.items {
                 let current = candidate.address == item.address;
                 selector = selector.push(popup::chip(
-                    candidate.label(),
+                    candidate.selector_label(),
                     match current {
                         true => Chip::Accent,
                         false => Chip::Plain,
                     },
                     ctx,
-                    (!current).then(|| event_message(Event::Select(candidate.address.clone()))),
+                    Some(event_message(Event::Select(candidate.address.clone()))),
                 ));
             }
-            // A tray of a dozen items is a strip too long for one line.
+            // Wrapping retains access to every item without letting the picker
+            // determine the card's width.
             card = card.block(selector.wrap());
         }
 
@@ -335,12 +351,14 @@ impl State {
             );
         }
 
-        let note: Element<'_, Message> = match has_menu {
-            true => widget::space::horizontal().into(),
-            false => popup::detail("no menu", ctx).into(),
-        };
+        // Naming the active item in the footer keeps these item-level methods
+        // attached to their target even below a long, scrolling menu.
+        let mut context = popup::lines().push(popup::detail(item.label(), ctx));
+        if !has_menu {
+            context = context.push(popup::detail("no menu", ctx));
+        }
         card = card.block(popup::split(
-            note,
+            context,
             [
                 popup::chip(
                     "activate",
@@ -736,11 +754,40 @@ impl Item {
         Some(icon::from_path(path))
     }
 
+    /// Prefer application-authored, human-facing metadata over the stable id.
+    /// The tooltip's first segment is its plain-text title; the remaining
+    /// segments are useful detail in the header, but too verbose for a picker.
     fn label(&self) -> &str {
-        self.title
+        let title = self
+            .title
             .as_deref()
-            .filter(|title| !title.is_empty())
-            .unwrap_or(&self.id)
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let tooltip_title = self
+            .tooltip
+            .as_deref()
+            .and_then(|tooltip| tooltip.split(" · ").next())
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+
+        if let Some(title) = title.filter(|title| !looks_like_identifier(title)) {
+            return title;
+        }
+        if let Some(title) = tooltip_title {
+            return title;
+        }
+        if let Some(title) = title {
+            return title;
+        }
+
+        let id = self.id.trim();
+        id.rsplit(['.', '/'])
+            .find(|part| !part.is_empty())
+            .unwrap_or("tray item")
+    }
+
+    fn selector_label(&self) -> Cow<'_, str> {
+        elide(self.label(), SELECTOR_LABEL_CHARS)
     }
 
     /// Just the icon, with the passive dimming and attention badge waybar
@@ -924,6 +971,32 @@ fn strip_markup(text: &str) -> String {
         .replace("&amp;", "&")
         .trim()
         .replace('\n', " ")
+}
+
+/// Titles without word separators that look like protocol identifiers are less
+/// useful than an item's tooltip title. Human titles, including single words,
+/// remain authoritative.
+fn looks_like_identifier(text: &str) -> bool {
+    if text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    text.starts_with('/')
+        || text.starts_with(':')
+        || text.contains('/')
+        || text.matches('_').count() >= 2
+        || text.matches('.').count() >= 2
+}
+
+/// Cap a selector label by characters rather than bytes, preserving UTF-8.
+fn elide(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.chars().count() <= limit {
+        return Cow::Borrowed(text);
+    }
+    let end = text
+        .char_indices()
+        .nth(limit)
+        .map_or(text.len(), |(index, _)| index);
+    Cow::Owned(format!("{}…", text[..end].trim_end()))
 }
 
 /// Wrap a module event for the bar's message type.

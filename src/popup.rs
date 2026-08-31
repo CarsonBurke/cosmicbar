@@ -36,13 +36,18 @@
 
 use std::borrow::Cow;
 
+use cosmic::iced::advanced::widget::{Operation, Tree, tree};
+use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
+use cosmic::iced::time::Instant;
 use cosmic::iced::widget::scrollable::{Direction, Scrollbar};
-use cosmic::iced::{Alignment, Length, Padding};
+use cosmic::iced::{
+    Alignment, Event as IcedEvent, Length, Padding, Rectangle, Size, Vector, window,
+};
 use cosmic::widget;
-use cosmic::{Apply, Element};
+use cosmic::{Apply, Element, Renderer, Theme};
 
 use crate::bar::Message;
-use crate::modules::Ctx;
+use crate::modules::{Ctx, ModuleId};
 use crate::theme::Palette;
 
 /// Text, rows and columns in the popup's own message type: `cosmic::widget`'s
@@ -73,10 +78,9 @@ pub const ROW_GAP: f32 = 8.0;
 /// and the bar itself.
 const LIST_HEIGHT: f32 = 420.0;
 
-/// Scrollbar geometry. The thumb is slim and lives centred in a gutter exactly
-/// [`PAD_X`] wide, which is the padding the list's own content would otherwise
-/// have used: the rows keep their alignment with every other block, and the
-/// thumb lands where a scrollbar belongs — against the card's edge.
+/// Scrollbar geometry. The thumb is slim and floats in the card's own right
+/// inset: [`PAD_X`] wide, so a thumb [`THUMB`] wide sits [`THUMB_MARGIN`] clear
+/// of the card's edge and never over a row's text.
 const THUMB: f32 = 6.0;
 const THUMB_MARGIN: f32 = (PAD_X - THUMB) / 2.0;
 
@@ -156,8 +160,16 @@ impl<'a> Card<'a> {
     }
 }
 
-/// The list block: full bleed, its content padded, its scrollbar in the gutter
-/// that padding would have been.
+/// The list block: full bleed, its content inset like every other block, and
+/// its scrollbar floating in the right inset.
+///
+/// The gutter is reserved by padding rather than by the scrollbar, because
+/// iced only gives an embedded scrollbar layout space while it is *visible*: a
+/// list short enough not to scroll would hand that width back to the content,
+/// and a row's action chip would land against the card's edge - or past it,
+/// since the popup surface is exactly as wide as the card. Padding is there
+/// either way, so a list that grows past [`LIST_HEIGHT`] gains a thumb without
+/// reflowing a single row.
 ///
 /// `Length::Shrink` on the scrollable is what makes the card fit its content:
 /// iced lays a vertical scrollable's content out with no height limit at all
@@ -168,10 +180,9 @@ impl<'a> Card<'a> {
 fn scroll<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
     content
         .apply(widget::container)
-        // No right padding: the scrollbar gutter is exactly that wide.
         .padding(Padding {
             top: PAD_Y,
-            right: 0.0,
+            right: PAD_X,
             bottom: PAD_Y,
             left: PAD_X,
         })
@@ -179,7 +190,7 @@ fn scroll<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
         .apply(widget::scrollable)
         .direction(scrollbar())
         // `Minimal` paints the thumb and nothing else. The default,
-        // `Permanent`, also paints a rail — from the COSMIC desktop theme
+        // `Permanent`, also paints a rail - from the COSMIC desktop theme
         // rather than from this bar's palette, which is a grey slab down the
         // side of a Catppuccin card.
         .class(cosmic::theme::iced::Scrollable::Minimal)
@@ -196,12 +207,10 @@ fn scrollbar() -> Direction {
         Scrollbar::new()
             .width(THUMB)
             .scroller_width(THUMB)
-            .margin(THUMB_MARGIN)
-            // Embeds the scrollbar: it takes layout space instead of floating
-            // over the rows. `spacing` is the gap it leaves between itself and
-            // the content, and the content's own padding is already zero on
-            // that side, so the gutter is exactly the thumb plus its margins.
-            .spacing(0.0),
+            // Floats over the content's right inset instead of taking layout
+            // space: `spacing` is what would embed it, and an embedded bar only
+            // reserves its width while the list actually overflows.
+            .margin(THUMB_MARGIN),
     )
 }
 
@@ -335,6 +344,13 @@ pub fn icon_chip<'a>(
     )
 }
 
+/// Standard external-app action for popup headers: an unobtrusive
+/// open-in-new glyph, always plain rather than a primary call to action.
+pub fn popout<'a>(ctx: &Ctx, on_press: Option<Message>) -> Element<'a, Message> {
+    // nf-md-open_in_new
+    icon_chip("\u{f03cc}", Chip::Plain, ctx, on_press)
+}
+
 fn button<'a>(
     label: Element<'a, Message>,
     style: Chip,
@@ -388,18 +404,204 @@ pub fn row<'a>(
     }
 }
 
-/// The same row, armed: painted like a destructive chip because it is one click
-/// from doing the thing it names. No hover fade — a row that is already solid
-/// red has nothing left to say about the pointer being over it.
-pub fn row_armed<'a>(
+/// Opening and content-switch motion. The child keeps its final layout for the
+/// whole animation; only the renderer translation changes, so no text is
+/// reshaped and autosize is not invalidated on every frame.
+const ENTER_MS: f32 = 140.0;
+const ENTER_OFFSET: f32 = 8.0;
+
+pub fn transition<'a>(
     content: impl Into<Element<'a, Message>>,
-    palette: Palette,
-    on_press: Option<Message>,
+    key: ModuleId,
 ) -> Element<'a, Message> {
-    widget::button::custom(content.into())
-        .width(Length::Fill)
-        .padding([ROW_INSET_Y, ROW_INSET_X])
-        .class(crate::theme::chip_danger(palette))
-        .on_press_maybe(on_press)
-        .into()
+    Element::new(PopupTransition {
+        content: content.into(),
+        key,
+    })
+}
+
+struct PopupTransition<'a> {
+    content: Element<'a, Message>,
+    key: ModuleId,
+}
+
+struct TransitionState {
+    key: ModuleId,
+    started: Instant,
+    offset: f32,
+}
+
+impl TransitionState {
+    fn new(key: ModuleId) -> Self {
+        Self {
+            key,
+            started: Instant::now(),
+            offset: -ENTER_OFFSET,
+        }
+    }
+
+    fn restart(&mut self, key: ModuleId) {
+        *self = Self::new(key);
+    }
+
+    fn sample(&self, at: Instant) -> (f32, bool) {
+        let elapsed = at
+            .checked_duration_since(self.started)
+            .unwrap_or_default()
+            .as_secs_f32()
+            * 1_000.0;
+        let progress = (elapsed / ENTER_MS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        (-ENTER_OFFSET * (1.0 - eased), progress < 1.0)
+    }
+}
+
+impl Widget<Message, Theme, Renderer> for PopupTransition<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<TransitionState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(TransitionState::new(self.key))
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<TransitionState>();
+        if state.key != self.key {
+            state.restart(self.key);
+        }
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &IcedEvent,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let IcedEvent::Window(window::Event::RedrawRequested(now)) = event {
+            let state = tree.state.downcast_mut::<TransitionState>();
+            let (offset, animating) = state.sample(*now);
+            state.offset = offset;
+            if animating {
+                shell.request_redraw();
+            }
+        }
+        let offset = tree.state.downcast_ref::<TransitionState>().offset;
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor - Vector::new(0.0, offset),
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let offset = tree.state.downcast_ref::<TransitionState>().offset;
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor - Vector::new(0.0, offset),
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        use cosmic::iced::advanced::Renderer as _;
+
+        let offset = tree.state.downcast_ref::<TransitionState>().offset;
+        let cursor = cursor - Vector::new(0.0, offset);
+        renderer.with_layer(layout.bounds(), |renderer| {
+            renderer.with_translation(Vector::new(0.0, offset), |renderer| {
+                self.content.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    style,
+                    layout,
+                    cursor,
+                    viewport,
+                );
+            });
+        });
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        let offset = tree.state.downcast_ref::<TransitionState>().offset;
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            Vector::new(translation.x, translation.y + offset),
+        )
+    }
 }

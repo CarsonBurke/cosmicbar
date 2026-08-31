@@ -43,7 +43,7 @@ pub struct Config {
     pub font_size: f32,
     /// Use bold weight for system text and Nerd Font icons.
     pub font_weight_bold: bool,
-    /// Palette name: `catppuccin-mocha` or `catppuccin-latte`.
+    /// Palette name: `system`, `catppuccin-mocha`, or `catppuccin-latte`.
     pub palette: String,
     /// Terminal used by modules that open a TUI.
     pub terminal: String,
@@ -108,7 +108,7 @@ impl Default for Config {
             height: 24,
             font_size: 16.0,
             font_weight_bold: true,
-            palette: "catppuccin-mocha".into(),
+            palette: "system".into(),
             terminal: "kitty".into(),
             overlay_layer: false,
             outputs: Vec::new(),

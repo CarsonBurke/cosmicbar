@@ -342,10 +342,9 @@ impl State {
     pub fn view(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let sample = self.sample.as_ref()?;
         let (icon, color) = temp_state(sample.temp_c, sample.device.slowdown_c, &ctx.palette);
-        Some(crate::theme::label_fixed(
+        Some(crate::theme::label(
             icon,
             format!("{}°C {}%", sample.temp_c, sample.gpu_percent),
-            "100°C 100%",
             ctx.font_size,
             cosmic::theme::Text::Color(color),
         ))

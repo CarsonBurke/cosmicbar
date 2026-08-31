@@ -46,8 +46,9 @@ fn main() -> cosmic::iced::Result {
         .client_decorations(false)
         .default_text_size(config.font_size)
         .default_font(theme::font(config.font_weight_bold))
-        // Our own palette, not COSMIC's (there is no cosmic-settings-daemon here).
-        .theme(cosmic::Theme::dark());
+        // Use the live COSMIC preference so default widgets and the bar's own
+        // palette agree, including after a light/dark or accent change.
+        .theme(cosmic::theme::system_preference());
 
     cosmic::app::run::<bar::Bar>(settings, config)
 }

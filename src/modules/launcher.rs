@@ -81,7 +81,7 @@ impl State {
         let color = if self.error.is_some() {
             ctx.palette.red
         } else {
-            ctx.palette.accent()
+            ctx.palette.fg()
         };
         Some(
             crate::theme::glyph_only(ICON, ctx.font_size)

@@ -13,13 +13,19 @@
 //! dismiss, per-entry default action, restore from history, mode toggle.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime};
 
 use cosmic::Element;
 use cosmic::app::Task;
-use cosmic::iced::Subscription;
 use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
+use cosmic::iced::{ContentFit, Length, Subscription};
+use cosmic::widget;
 use zbus::zvariant::Value;
 
 use crate::bar::Message;
@@ -55,6 +61,12 @@ const SUMMARY_LIMIT: usize = 64;
 const BODY_LIMIT: usize = 160;
 /// History entries shown; mako's own `max-history` is usually 5.
 const HISTORY_LIMIT: usize = 5;
+/// Preview texture bounds. Full-resolution screenshots are decoded and
+/// downsampled off the UI thread before a widget ever sees them.
+const IMAGE_WIDTH: u32 = 384;
+const IMAGE_HEIGHT: u32 = 180;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_ALLOC: u64 = 192 * 1024 * 1024;
 
 /// Reconnect ladder for a session bus that is down or restarting.
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
@@ -69,6 +81,9 @@ pub struct Notification {
     app_name: String,
     summary: String,
     body: String,
+    /// Local raster image supplied through mako's `app-icon` field. The path is
+    /// cheap notification metadata; its thumbnail is loaded only for the popup.
+    image_path: Option<PathBuf>,
     /// 0 low, 1 normal, 2 critical, per the freedesktop spec.
     urgency: u8,
     /// Action key to label, in the order mako returned them.
@@ -81,6 +96,57 @@ pub struct Snapshot {
     waiting: Vec<Notification>,
     history: Vec<Notification>,
     modes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImageCache {
+    entries: HashMap<PathBuf, CachedImage>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedImage {
+    fingerprint: Fingerprint,
+    /// `None` remembers a failed decode until the file changes.
+    handle: Option<widget::image::Handle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct ImageRequest {
+    revision: u64,
+    paths: Vec<PathBuf>,
+    cached: ImageCache,
+}
+
+// The cached handles are input data, not subscription identity. A result must
+// not restart its own request; a new mako snapshot must invalidate old work
+// even when an application overwrites the same path.
+impl PartialEq for ImageRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision && self.paths == other.paths
+    }
+}
+
+impl Eq for ImageRequest {}
+
+impl Hash for ImageRequest {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.revision.hash(state);
+        self.paths.hash(state);
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// The session bus, with a terse `Debug`: the bar logs every message it
@@ -99,6 +165,12 @@ pub enum Event {
     /// mako answered. Carries the bus so `update` can call it back.
     Connected(Bus),
     Snapshot(Arc<Snapshot>),
+    ImagesLoaded {
+        revision: u64,
+        paths: Arc<[PathBuf]>,
+        images: ImageCache,
+    },
+    ImagesCleared,
     /// The service is not on the bus: the module hides.
     Absent,
     Disconnected,
@@ -115,17 +187,39 @@ pub enum Event {
 pub struct State {
     connection: Option<zbus::Connection>,
     snapshot: Option<Arc<Snapshot>>,
+    revision: u64,
+    images: ImageCache,
     error: Option<String>,
 }
 
 impl State {
-    /// One signal subscription for the whole session, popup or not: the count
-    /// in the bar has to be right while the popup is closed, which is most of
-    /// the time. mako's history is capped at a handful of entries, so it comes
-    /// down with every refresh rather than needing a popup-gated stream.
-    pub fn subscription(&self, _open: bool) -> Subscription<Message> {
-        Subscription::run(stream).map(event_message)
+    /// Text and counts stay on the always-live mako signal stream. A second
+    /// subscription exists only while the popup is open: it loads bounded
+    /// thumbnails and is dropped — canceling queued work — on close.
+    pub fn subscription(&self, open: bool) -> Subscription<Message> {
+        let live = Subscription::run(stream).map(event_message);
+        let images = if open {
+            Subscription::run_with(
+                ImageRequest {
+                    revision: self.revision,
+                    paths: self.image_paths(),
+                    cached: self.images.clone(),
+                },
+                image_stream,
+            )
+            .map(event_message)
+        } else {
+            Subscription::run(clear_images).map(event_message)
+        };
+        Subscription::batch([live, images])
     }
+    fn image_paths(&self) -> Vec<PathBuf> {
+        self.snapshot
+            .as_deref()
+            .map(image_paths)
+            .unwrap_or_default()
+    }
+
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
         match event {
@@ -135,16 +229,35 @@ impl State {
                 Task::none()
             }
             Event::Snapshot(snapshot) => {
+                self.revision = self.revision.wrapping_add(1);
+                let paths = image_paths(&snapshot);
+                self.images.entries.retain(|path, _| paths.contains(path));
                 self.snapshot = Some(snapshot);
+                Task::none()
+            }
+            Event::ImagesLoaded {
+                revision,
+                paths,
+                images,
+            } => {
+                if revision == self.revision && self.image_paths().as_slice() == paths.as_ref() {
+                    self.images = images;
+                }
+                Task::none()
+            }
+            Event::ImagesCleared => {
+                self.images.entries.clear();
                 Task::none()
             }
             Event::Absent => {
                 self.snapshot = None;
+                self.images.entries.clear();
                 Task::none()
             }
             Event::Disconnected => {
                 self.connection = None;
                 self.snapshot = None;
+                self.images.entries.clear();
                 Task::none()
             }
             Event::Dismiss(id) => self.call(move |mako| async move {
@@ -323,9 +436,9 @@ impl State {
         false
     }
 
-    /// One notification: clicking the text invokes its default action, the
-    /// glyph chip dismisses it, and any further actions get a chip of their
-    /// own.
+    /// One notification: clicking its text or image invokes the default
+    /// action, the glyph chip dismisses it, and any further actions get a chip
+    /// of their own.
     fn entry<'a>(&'a self, notification: &'a Notification, ctx: &Ctx) -> Element<'a, Message> {
         let palette = ctx.palette;
         let mut lines = popup::lines().push(
@@ -356,19 +469,20 @@ impl State {
             .actions
             .iter()
             .find(|(key, _)| key == "default")
-            .map(|(key, _)| key.clone());
+            .map(|(key, _)| key);
+        let invoke_default = || {
+            default_action.map(|action| {
+                event_message(Event::Invoke {
+                    id: notification.id,
+                    action: action.clone(),
+                })
+            })
+        };
         // Only a notification that has somewhere to go is a click target; one
         // without a default action is text that happens to have chips beside
         // it, and lighting it up would promise an action it cannot perform.
-        let content: Element<'a, Message> = match default_action {
-            Some(action) => popup::row(
-                lines,
-                palette,
-                Some(event_message(Event::Invoke {
-                    id: notification.id,
-                    action,
-                })),
-            ),
+        let content: Element<'a, Message> = match invoke_default() {
+            Some(message) => popup::row(lines, palette, Some(message)),
             None => lines.into(),
         };
 
@@ -394,7 +508,24 @@ impl State {
             ctx,
             Some(event_message(Event::Dismiss(notification.id))),
         ));
-        popup::split(content, actions).into()
+
+        let mut entry = popup::lines().push(popup::split(content, actions));
+        if let Some(handle) = notification
+            .image_path
+            .as_deref()
+            .and_then(|path| self.images.handle(path))
+        {
+            let image = widget::image(handle)
+                .width(Length::Fill)
+                .height(Length::Fixed(IMAGE_HEIGHT as f32))
+                .content_fit(ContentFit::Contain)
+                .border_radius(crate::theme::ROW_CORNERS);
+            entry = entry.push(match invoke_default() {
+                Some(message) => popup::row(image, palette, Some(message)),
+                None => image.into(),
+            });
+        }
+        entry.into()
     }
 
     /// The mode list mako should end up with when do-not-disturb is toggled.
@@ -477,6 +608,30 @@ trait Mako {
 /// Wrap a module event for the bar's message type.
 fn event_message(event: Event) -> Message {
     Message::Module(ModuleEvent::Notifications(event))
+}
+
+fn clear_images() -> impl Stream<Item = Event> {
+    cosmic::iced::futures::stream::once(async { Event::ImagesCleared })
+}
+
+fn image_stream(request: &ImageRequest) -> impl Stream<Item = Event> + use<> {
+    let revision = request.revision;
+    let mut images = request.cached.clone();
+    let paths = request.paths.clone();
+    cosmic::iced::stream::channel(1, async move |mut sender| {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        images.refresh(paths.clone(), cancelled.clone()).await;
+        if !cancelled.load(Ordering::Acquire) {
+            let _ = sender
+                .send(Event::ImagesLoaded {
+                    revision,
+                    paths: paths.into(),
+                    images,
+                })
+                .await;
+        }
+    })
 }
 
 fn stream() -> impl Stream<Item = Event> {
@@ -565,16 +720,24 @@ async fn publish(
 
 async fn snapshot(connection: &zbus::Connection) -> anyhow::Result<Snapshot> {
     let mako = MakoProxy::new(connection).await?;
+    let waiting = mako.list_notifications().await?;
+    let history = mako.list_history().await?;
     Ok(Snapshot {
-        waiting: mako
-            .list_notifications()
-            .await?
-            .iter()
-            .map(parse)
-            .collect(),
-        history: mako.list_history().await?.iter().map(parse).collect(),
+        waiting: waiting.iter().map(parse).collect(),
+        history: history.iter().map(parse).collect(),
         modes: mako.list_modes().await?,
     })
+}
+
+fn image_paths(snapshot: &Snapshot) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = snapshot
+        .waiting
+        .iter()
+        .filter_map(|notification| notification.image_path.clone())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 type Props = HashMap<String, zbus::zvariant::OwnedValue>;
@@ -591,6 +754,7 @@ fn parse(props: &Props) -> Notification {
         app_name: string(props, "app-name"),
         summary: string(props, "summary"),
         body: string(props, "body"),
+        image_path: local_image_path(&string(props, "app-icon")),
         urgency: props
             .get("urgency")
             .and_then(|value| value.downcast_ref::<u8>().ok())
@@ -605,6 +769,113 @@ fn string(props: &Props, key: &str) -> String {
         .and_then(|value| value.downcast_ref::<&str>().ok())
         .unwrap_or_default()
         .to_owned()
+}
+
+impl ImageCache {
+    /// Keep only requested images. Cache hits reuse the thumbnail handle;
+    /// misses decode together on Tokio's blocking pool.
+    async fn refresh(&mut self, paths: Vec<PathBuf>, cancelled: Arc<AtomicBool>) {
+        let previous = std::mem::take(&mut self.entries);
+        match tokio::task::spawn_blocking(move || load_images(paths, previous, &cancelled)).await {
+            Ok(entries) => self.entries = entries,
+            Err(error) => log::debug!("notification image worker failed: {error}"),
+        }
+    }
+
+    fn handle(&self, path: &Path) -> Option<widget::image::Handle> {
+        self.entries.get(path)?.handle.clone()
+    }
+}
+
+fn load_images(
+    paths: Vec<PathBuf>,
+    mut previous: HashMap<PathBuf, CachedImage>,
+    cancelled: &AtomicBool,
+) -> HashMap<PathBuf, CachedImage> {
+    let mut current = HashMap::with_capacity(paths.len());
+    for path in paths {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        if current.contains_key(&path) {
+            continue;
+        }
+        let Some(fingerprint) = fingerprint(&path) else {
+            continue;
+        };
+        if let Some(cached) = previous.remove(&path)
+            && cached.fingerprint == fingerprint
+        {
+            current.insert(path, cached);
+            continue;
+        }
+        let handle = decode_thumbnail(&path);
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        current.insert(
+            path,
+            CachedImage {
+                fingerprint,
+                handle,
+            },
+        );
+    }
+    current
+}
+
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    let metadata = path.metadata().ok()?;
+    metadata.is_file().then(|| Fingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn decode_thumbnail(path: &Path) -> Option<widget::image::Handle> {
+    let mut reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+
+    let pixels = reader
+        .decode()
+        .inspect_err(|error| {
+            log::debug!(
+                "notification image {} could not be decoded: {error}",
+                path.display()
+            );
+        })
+        .ok()?
+        .thumbnail(IMAGE_WIDTH, IMAGE_HEIGHT)
+        .to_rgba8();
+    let (width, height) = pixels.dimensions();
+    Some(widget::image::Handle::from_rgba(
+        width,
+        height,
+        pixels.into_raw(),
+    ))
+}
+
+/// Mako exposes the original `app_icon` argument but not notification hints.
+/// Screenshot tools, including niri's, put their capture here as a local path
+/// or `file:` URI. Theme names remain ordinary app icons and are deliberately
+/// not expanded into a large preview.
+fn local_image_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Some(path.to_owned());
+    }
+    let url = url::Url::parse(value).ok()?;
+    (url.scheme() == "file")
+        .then(|| url.to_file_path().ok())
+        .flatten()
 }
 
 /// `a{ss}` of action key to label.
@@ -627,5 +898,102 @@ fn elide(text: &str, limit: usize) -> String {
     match flat.char_indices().nth(limit) {
         Some((index, _)) => format!("{}…", flat[..index].trim_end()),
         None => flat,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Event, IMAGE_HEIGHT, IMAGE_WIDTH, ImageCache, State, load_images, local_image_path,
+    };
+    use cosmic::widget;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn local_image_path_accepts_paths_and_file_uris_only() {
+        assert_eq!(
+            local_image_path("/tmp/capture.png"),
+            Some(PathBuf::from("/tmp/capture.png"))
+        );
+        assert_eq!(
+            local_image_path("file:///tmp/a%20capture.png"),
+            Some(PathBuf::from("/tmp/a capture.png"))
+        );
+        assert_eq!(local_image_path("camera-photo"), None);
+        assert_eq!(local_image_path("https://example.com/capture.png"), None);
+    }
+
+    #[test]
+    fn cancelled_loader_skips_queued_images() {
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/popup.png");
+        let cancelled = AtomicBool::new(true);
+        assert!(load_images(vec![image], HashMap::new(), &cancelled).is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_cache_decodes_a_bounded_thumbnail() {
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/popup.png");
+        let mut cache = ImageCache::default();
+        cache
+            .refresh(
+                vec![image.clone()],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+
+        let handle = cache
+            .entries
+            .get(&image)
+            .unwrap()
+            .handle
+            .clone()
+            .unwrap();
+        let widget::image::Handle::Rgba { width, height, .. } = &handle else {
+            panic!("thumbnail was not decoded to RGBA");
+        };
+        assert!(*width <= IMAGE_WIDTH);
+        assert!(*height <= IMAGE_HEIGHT);
+
+        cache
+            .refresh(
+                vec![image.clone()],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(
+            cache.entries.get(&image).unwrap().handle.as_ref(),
+            Some(&handle)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_cache_remembers_decode_failures() {
+        let text = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut cache = ImageCache::default();
+        cache
+            .refresh(vec![text.clone()], Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(cache.entries.get(&text).unwrap().handle.is_none());
+
+        cache
+            .refresh(vec![text.clone()], Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(cache.entries.get(&text).unwrap().handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_popup_releases_thumbnail_handles() {
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/popup.png");
+        let mut state = State::default();
+        state
+            .images
+            .refresh(vec![image], Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(!state.images.entries.is_empty());
+
+        let _task = state.update(Event::ImagesCleared);
+        assert!(state.images.entries.is_empty());
     }
 }

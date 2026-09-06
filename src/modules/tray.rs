@@ -75,6 +75,12 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// The object path the spec asks an item to use, and the fallback when the
 /// watcher cannot say where one actually is.
 const ITEM_OBJECT: &str = "/StatusNotifierItem";
+/// How long to let `system-tray` finish reading the watcher's registry before
+/// the bar fills in whatever that read loaded but never announced.
+/// `Client::new` returns before the read even starts and every item in it
+/// costs a `GetAll` round trip, so this is a ceiling on a handover, not a
+/// delay: items announce themselves the moment they are loaded.
+const INITIAL_LOAD: Duration = Duration::from_secs(2);
 
 /// The live host: the `system-tray` client plus a bus of our own to call items
 /// back on.
@@ -1033,36 +1039,114 @@ trait Watcher {
     fn registered_status_notifier_items(&self) -> zbus::Result<Vec<String>>;
 }
 
+/// Everything the watcher currently lists. This is the only authority on what
+/// exists: `system-tray` reads it once, in a task it spawns after `new`
+/// returns, and never retries.
+///
+/// Entries are `<bus name>` or the non-conforming `<bus name><object path>`
+/// that libappindicator sends.
+async fn registered_items(connection: &zbus::Connection) -> zbus::Result<Vec<String>> {
+    WatcherProxy::builder(connection)
+        // Read it once; a cache here would add a match rule for a value the
+        // bar only looks at on a click and on a handover.
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?
+        .registered_status_notifier_items()
+        .await
+}
+
+/// The bus name half of a registry entry, which is the address every
+/// `system-tray` event is keyed by.
+fn entry_destination(entry: &str) -> &str {
+    entry.split_once('/').map_or(entry, |(name, _)| name)
+}
+
+/// The object path `entry` places `address` at, or `None` if the entry is a
+/// different item's.
+fn entry_object(entry: &str, address: &str) -> Option<String> {
+    match entry.split_once('/') {
+        Some((name, path)) if name == address => Some(format!("/{path}")),
+        None if entry == address => Some(ITEM_OBJECT.to_owned()),
+        _ => None,
+    }
+}
+
 /// The object path an item registered under, defaulting to the path the spec
 /// asks for when the watcher cannot be reached.
 ///
-/// Registered entries are `<bus name>` or the non-conforming
-/// `<bus name><object path>` that libappindicator sends. One call per click is
-/// cheaper than mirroring the registry, and cannot go stale.
+/// One call per click is cheaper than mirroring the registry, and cannot go
+/// stale.
 async fn item_path(connection: &zbus::Connection, address: &str) -> String {
-    let registered = async {
-        WatcherProxy::builder(connection)
-            // Read it once; a cache here would add a match rule for a value
-            // we only look at on a click.
-            .cache_properties(zbus::proxy::CacheProperties::No)
-            .build()
-            .await?
-            .registered_status_notifier_items()
-            .await
-    }
-    .await;
-    let Ok(registered) = registered else {
+    let Ok(registered) = registered_items(connection).await else {
         return ITEM_OBJECT.to_owned();
     };
     registered
         .iter()
-        .filter_map(|entry| match entry.split_once('/') {
-            Some((name, path)) if name == address => Some(format!("/{path}")),
-            None if entry == address => Some(ITEM_OBJECT.to_owned()),
-            _ => None,
-        })
-        .next()
+        .find_map(|entry| entry_object(entry, address))
         .unwrap_or_else(|| ITEM_OBJECT.to_owned())
+}
+
+/// The registered bus names, ordered so the bar places the tray the same way
+/// on every reconnect.
+async fn seed_addresses(connection: &zbus::Connection) -> Vec<Arc<str>> {
+    let registered = match registered_items(connection).await {
+        Ok(registered) => registered,
+        Err(error) => {
+            log::debug!("tray: watcher registry unavailable: {error}");
+            return Vec::new();
+        }
+    };
+    let mut addresses: Vec<Arc<str>> = registered
+        .iter()
+        .map(|entry| Arc::from(entry_destination(entry)))
+        .collect();
+    // One bus name can register two objects; `system-tray` keys its items by
+    // the name alone, so the second entry is the same item.
+    addresses.sort_unstable();
+    addresses.dedup();
+    // Stable, so the names without a serial keep the order above.
+    addresses.sort_by_key(|address| bus_order(address));
+    addresses
+}
+
+/// Sort key for a unique bus name (`:1.98`): lexicographically `:1.4504` comes
+/// before `:1.98`, so the two halves of the serial are compared as numbers,
+/// which puts the items in the order they registered. A name that is not a
+/// unique bus name has no serial and sorts after every name that does.
+fn bus_order(address: &str) -> (u8, u64, u64) {
+    let serial = address
+        .strip_prefix(':')
+        .and_then(|serial| serial.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)));
+    match serial {
+        Some((major, minor)) => (0, major, minor),
+        None => (1, 0, 0),
+    }
+}
+
+/// The registered items `system-tray` holds but never announced, in registry
+/// order.
+///
+/// The map behind `Client::items` is a `HashMap`, so it is read through the
+/// ordered registry rather than iterated.
+fn unannounced_items(
+    client: &Client,
+    expected: &[Arc<str>],
+    announced: &HashSet<Arc<str>>,
+) -> Vec<(Arc<str>, StatusNotifierItem, Option<TrayMenu>)> {
+    let items = client.items();
+    let Ok(items) = items.lock() else {
+        return Vec::new();
+    };
+    expected
+        .iter()
+        .filter(|address| !announced.contains(*address))
+        .filter_map(|address| {
+            let (item, menu) = items.get(&**address)?;
+            Some((address.clone(), item.clone(), menu.clone()))
+        })
+        .collect()
 }
 
 /// A host that re-registers itself if the session bus or the watcher restarts.
@@ -1095,54 +1179,84 @@ async fn session(
     // `Client` keeps its own connection private, and the bar needs one to call
     // items back on.
     let connection = zbus::Connection::session().await?;
-    // Subscribe before reading the current items, so an item that registers
-    // during the handover is seen exactly once.
+    // Subscribe before anything else, so an item that registers during the
+    // handover is announced here rather than only landing in the client's map.
     let mut events = client.subscribe();
     if sender
         .send(Event::Connected(Host {
             client: client.clone(),
-            connection,
+            // Reference counted internally; the registry read below uses the
+            // same bus.
+            connection: connection.clone(),
         }))
         .await
         .is_err()
     {
         return Ok(());
     }
-    let known: Vec<(Arc<str>, StatusNotifierItem, Option<TrayMenu>)> = client
-        .items()
-        .lock()
-        .map(|items| {
-            items
-                .iter()
-                .map(|(address, (item, menu))| {
-                    (Arc::from(address.as_str()), item.clone(), menu.clone())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    for (address, item, menu) in known {
-        if sender
-            .send(Event::Added(address.clone(), Box::new(item)))
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-        if let Some(menu) = menu {
-            let _ = sender
-                .send(Event::Updated(address, UpdateEvent::Menu(menu)))
-                .await;
-        }
-    }
+    // `Client::new` returns before it has read the watcher's registry: that
+    // read happens in a task it spawns, and every item in it costs a `GetAll`
+    // round trip, so the client's map is still empty at this point and the
+    // snapshot this used to take was always empty. Take the registry as the
+    // authority instead, let the broadcast announce those items as it loads
+    // them, and only fill in what it never announced.
+    let expected = seed_addresses(&connection).await;
+    // Addresses already sent to the bar, so the fill-in cannot duplicate one.
+    let mut announced: HashSet<Arc<str>> = HashSet::with_capacity(expected.len());
+    let mut settle = (!expected.is_empty()).then(|| Instant::now() + INITIAL_LOAD);
 
     loop {
-        match events.recv().await {
+        let received = match settle {
+            None => events.recv().await,
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline.into(), events.recv()).await {
+                    Ok(received) => received,
+                    // The initial read is as far along as it is going to get.
+                    Err(_) => {
+                        settle = None;
+                        let unannounced = unannounced_items(&client, &expected, &announced);
+                        // The registry lists items and the client holds none of
+                        // them: its one read failed, and nothing in
+                        // `system-tray` retries it. Let the ladder in `stream`
+                        // build a fresh host rather than run on with a tray the
+                        // bar knows nothing about.
+                        anyhow::ensure!(
+                            !announced.is_empty() || !unannounced.is_empty(),
+                            "watcher lists {} item(s) the tray client never loaded",
+                            expected.len()
+                        );
+                        for (address, item, menu) in unannounced {
+                            log::debug!("tray: seeding {address} from the watcher registry");
+                            if sender
+                                .send(Event::Added(address.clone(), Box::new(item)))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            if let Some(menu) = menu {
+                                let _ = sender
+                                    .send(Event::Updated(address, UpdateEvent::Menu(menu)))
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        match received {
             Ok(ClientEvent::Add(address, item)) => {
-                if sender
-                    .send(Event::Added(address.into(), item))
-                    .await
-                    .is_err()
-                {
+                let address: Arc<str> = address.into();
+                if settle.is_some() {
+                    announced.insert(address.clone());
+                    // Every registered item announced itself; nothing is left
+                    // for the fill-in to do, so stop watching the clock.
+                    if expected.iter().all(|address| announced.contains(address)) {
+                        settle = None;
+                    }
+                }
+                if sender.send(Event::Added(address, item)).await.is_err() {
                     return Ok(());
                 }
             }
@@ -1198,4 +1312,50 @@ fn gtk_icon_theme() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two registry formats a watcher hands out: a bare bus name, and the
+    /// bus name with the item's object path glued on.
+    #[test]
+    fn registry_entries_split_into_address_and_object() {
+        assert_eq!(entry_destination(":1.4504/StatusNotifierItem"), ":1.4504");
+        assert_eq!(entry_destination(":1.58"), ":1.58");
+
+        assert_eq!(
+            entry_object(":1.4504/StatusNotifierItem", ":1.4504").as_deref(),
+            Some("/StatusNotifierItem")
+        );
+        assert_eq!(
+            entry_object(":1.72/org/ayatana/NotificationItem/x", ":1.72").as_deref(),
+            Some("/org/ayatana/NotificationItem/x")
+        );
+        // No object path published: the spec's own path.
+        assert_eq!(entry_object(":1.58", ":1.58").as_deref(), Some(ITEM_OBJECT));
+        // A different item's entry contributes nothing.
+        assert_eq!(entry_object(":1.4504/StatusNotifierItem", ":1.58"), None);
+        assert_eq!(entry_object(":1.58", ":1.4504"), None);
+    }
+
+    /// Registry order is what the bar places items in, and the registry is a
+    /// set: ordering by serial is what stops the tray reshuffling on every
+    /// reconnect. Lexicographic order would put `:1.4504` first.
+    #[test]
+    fn addresses_order_by_bus_serial() {
+        let mut addresses = [":1.4504", ":1.98", "org.kde.StatusNotifierItem-1", ":1.7"];
+        addresses.sort_by_key(|address| bus_order(address));
+        assert_eq!(
+            addresses,
+            [
+                ":1.7",
+                ":1.98",
+                ":1.4504",
+                // Not a unique bus name, so it has no serial and sorts last.
+                "org.kde.StatusNotifierItem-1"
+            ]
+        );
+    }
 }

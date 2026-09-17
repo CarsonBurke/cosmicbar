@@ -7,8 +7,8 @@
 //! gap makes the ink-to-text distance the same everywhere.
 //!
 //! Generated from `CommitMono Nerd Font Mono` (the family in `theme::icon_font`)
-//! by `contrib/glyph-bearings.py`; rerun it after changing the icon font or a
-//! glyph constant.
+//! by `cargo run --example glyph-bearings`; rerun it after changing the icon font
+//! or a glyph constant.
 
 /// `(codepoint, left bearing, right bearing)`, sorted by codepoint. Glyphs whose
 /// ink fills the cell are omitted: their bearings round to zero. The left

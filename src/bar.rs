@@ -30,6 +30,7 @@ use crate::modules::{self, Ctx, ModuleId, Modules};
 /// Popup width bounds; the height follows the content.
 const POPUP_MIN_WIDTH: f32 = 280.0;
 pub const POPUP_MAX_WIDTH: f32 = 420.0;
+pub const CALENDAR_MAX_WIDTH: f32 = 600.0;
 const POPUP_MAX_HEIGHT: f32 = 720.0;
 
 static AUTOSIZE_ID: std::sync::LazyLock<cosmic::widget::Id> =
@@ -462,7 +463,7 @@ impl Bar {
                 height: self.config.height as f32,
             });
         let size = self.popup.as_ref().map_or((360, 240), |popup| popup.size);
-        let positioner = popup_positioner(anchor, size);
+        let positioner = popup_positioner(anchor, size, module);
 
         // Keep the grabbing xdg-popup alive while moving between cells on the
         // same bar. Destroying it and creating a replacement in one update races
@@ -531,9 +532,9 @@ impl Bar {
         )
         .limits(
             Limits::NONE
-                .min_width(POPUP_MIN_WIDTH)
+                .min_width(popup_min_width(popup.module))
                 .min_height(1.0)
-                .max_width(POPUP_MAX_WIDTH)
+                .max_width(popup_max_width(popup.module))
                 .max_height(POPUP_MAX_HEIGHT),
         )
         .into()
@@ -756,13 +757,29 @@ impl Bar {
     }
 }
 
-fn popup_positioner(anchor: Rectangle, size: (u32, u32)) -> SctkPositioner {
+fn popup_min_width(module: ModuleId) -> f32 {
+    if module == ModuleId::Date {
+        1.0
+    } else {
+        POPUP_MIN_WIDTH
+    }
+}
+
+fn popup_max_width(module: ModuleId) -> f32 {
+    if module == ModuleId::Date {
+        CALENDAR_MAX_WIDTH
+    } else {
+        POPUP_MAX_WIDTH
+    }
+}
+
+fn popup_positioner(anchor: Rectangle, size: (u32, u32), module: ModuleId) -> SctkPositioner {
     SctkPositioner {
         size: Some(size),
         size_limits: Limits::NONE
-            .min_width(POPUP_MIN_WIDTH)
+            .min_width(popup_min_width(module))
             .min_height(1.0)
-            .max_width(POPUP_MAX_WIDTH)
+            .max_width(popup_max_width(module))
             .max_height(POPUP_MAX_HEIGHT),
         anchor_rect: Rectangle {
             x: anchor.x.round() as i32,

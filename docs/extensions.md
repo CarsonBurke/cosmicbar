@@ -6,8 +6,8 @@ stdout. It can be written in any language that can print a line.
 
 Nothing in the protocol has an interval: the bar draws the last frame it was
 sent, and an extension sends a frame when its own source told it something
-changed. `contrib/extensions/cosmicbar-mlq` is a complete example in
-dependency-free Python that streams the local ML job queue.
+changed. [`src/bin/cosmicbar-mlq.rs`](../src/bin/cosmicbar-mlq.rs) is a complete
+native Rust example that streams the local ML job queue.
 
 ## Declaring one
 
@@ -17,7 +17,7 @@ right = ["extension:mlq", "volume", "power"]
 
 [[extensions]]
 name = "mlq"
-command = ["/home/you/bin/cosmicbar-mlq"]
+command = ["cosmicbar-mlq"]
 ```
 
 A region places the module as `extension:<name>`; the same string addresses it
@@ -111,33 +111,35 @@ Colours are palette roles, never hex, so an extension follows the bar's theme:
   writer, not a bar cell: the bar stops reading and restarts the program.
 - A malformed frame is logged and ignored; the last good frame stays on screen.
 
-## Minimal example
+## Native worked example
 
-```python
-#!/usr/bin/env python3
-import json, sys
+Install the bundled extension from the repository:
 
-state = {"popup": False, "pokes": 0}
-last = None
-
-def frame() -> None:
-    global last
-    body = json.dumps({
-        "cell": {"glyph": "\uf120", "text": f"hello {state['pokes']}", "color": "accent"},
-        "popup": [{"row": {"lines": [{"text": f"popup is {'open' if state['popup'] else 'shut'}"}],
-                           "action": {"id": "poke", "label": "poke"}}}],
-    })
-    # The rule the bar cares about: never write a frame it already has.
-    if body != last:
-        last = body
-        print(body, flush=True)
-
-frame()
-for line in sys.stdin:
-    message = json.loads(line)
-    if "popup" in message:
-        state["popup"] = bool(message["popup"])
-    if message.get("action") == "poke":
-        state["pokes"] += 1
-    frame()
+```sh
+cargo install --path . --bin cosmicbar-mlq
 ```
+
+Ensure Cargo's installation directory (normally `~/.cargo/bin`) is on the
+bar's `PATH`, or use the installed binary's absolute path in `command`.
+
+The complete implementation is
+[`src/bin/cosmicbar-mlq.rs`](../src/bin/cosmicbar-mlq.rs). It subscribes to mlqd's
+version-8 length-prefixed JSON socket protocol, accepting frames up to 1 MiB.
+It looks for `$XDG_RUNTIME_DIR/mlqueue/mlqd.sock`, falling back to
+`$XDG_STATE_HOME/mlqueue/runtime/mlqd.sock` (or
+`~/.local/state/mlqueue/runtime/mlqd.sock` when `XDG_STATE_HOME` is unset).
+No queue polling or external interpreter is involved.
+
+The cell shows the longest-running job and its elapsed time; an idle queue
+hides it. The popup has a pinned pause/unpause button and a cancel button for
+each live job. A separate task serializes mutations so a slow response cannot
+hold up popup notifications. Failed mutations appear in the popup until a
+successful mutation or a new snapshot clears the error.
+
+Elapsed times refresh at the next displayed digit: seconds for the first
+minute, then minutes. With the popup closed only the cell's headline controls
+that cadence; opening it includes every visible run. Job start estimates stay
+fixed through unrelated status updates. A disconnected daemon leaves the last
+snapshot visible, mutes a running cell and marks the header as reconnecting.
+Reconnections back off through 1, 2, 5, 10 and 30 seconds, resetting after a
+60-second healthy session. Stdin EOF or a broken stdout pipe ends the extension.

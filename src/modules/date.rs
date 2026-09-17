@@ -1,9 +1,12 @@
 //! Date, with a real calendar in its popup instead of a pango tooltip.
 
+mod agenda;
+
 use std::process::Stdio;
 
 use cosmic::{Apply, Element};
 use cosmic::app::Task;
+use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget;
 use cosmic::widget::calendar::{CalendarModel, get_calendar_first};
@@ -14,6 +17,7 @@ use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
 use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
+use self::agenda::AgendaEvent;
 
 pub const ISLAND: Island = Island::Join;
 
@@ -29,6 +33,24 @@ pub enum Event {
     Copy(Date),
     Open(Date),
     Opened(Result<(), String>),
+    AgendaLoading(Date),
+    AgendaLoaded(AgendaSnapshot),
+}
+
+#[derive(Clone)]
+pub struct AgendaSnapshot {
+    date: Date,
+    events: Result<Vec<AgendaEvent>, String>,
+}
+
+// Module messages are logged by the bar. Never include private calendar content.
+impl std::fmt::Debug for AgendaSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgendaSnapshot")
+            .field("date", &self.date)
+            .field("event_count", &self.events.as_ref().ok().map(Vec::len))
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +60,7 @@ pub struct State {
     follows_visible_day: bool,
     copied: Option<Date>,
     error: Option<String>,
+    agenda: Option<AgendaSnapshot>,
 }
 
 impl Default for State {
@@ -54,6 +77,7 @@ impl State {
             follows_visible_day: true,
             copied: None,
             error: None,
+            agenda: None,
         }
     }
 
@@ -68,12 +92,28 @@ impl State {
         }
     }
 
-    pub fn subscription(&self, _open: bool) -> Subscription<Message> {
-        Subscription::none()
+    pub fn subscription(&self, open: bool) -> Subscription<Message> {
+        if open {
+            Subscription::run_with(self.calendar.selected, agenda_stream)
+        } else {
+            Subscription::none()
+        }
     }
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
         match event {
+            Event::AgendaLoading(date) => {
+                if date == self.calendar.selected {
+                    self.agenda = None;
+                }
+                Task::none()
+            }
+            Event::AgendaLoaded(snapshot) => {
+                if snapshot.date == self.calendar.selected {
+                    self.agenda = Some(snapshot);
+                }
+                Task::none()
+            }
             Event::PrevMonth => {
                 self.move_month(-1);
                 Task::none()
@@ -217,7 +257,7 @@ impl State {
             .push(weekdays)
             .push(week_rows)
             .apply(widget::container)
-            .width(Length::Fill)
+            .width(Length::Fixed(CALENDAR_WIDTH))
             .align_x(Alignment::Center);
 
         let week = self.calendar.selected.iso_week_date().week();
@@ -243,18 +283,93 @@ impl State {
             ));
         }
         let selection = popup::detail(status, ctx);
+        let body = widget::Row::new()
+            .push(self.agenda_view(today, ctx))
+            .push(calendar)
+            .spacing(AGENDA_GAP)
+            .width(Length::Shrink);
 
         Some(
             Card::new()
                 .block(header)
-                .block(calendar)
+                .block(body)
                 .block(popup::split(selection, actions))
                 .maybe(self.error.as_ref().map(|error| {
                     popup::detail(error.as_str(), ctx)
                         .class(cosmic::theme::Text::Color(ctx.palette.red))
                 }))
-                .build(),
+                .build_fit(),
         )
+    }
+
+    fn agenda_view(&self, today: Date, ctx: &Ctx) -> Element<'_, Message> {
+        let mut items = popup::column().width(Length::Shrink);
+        let selected = self.calendar.selected;
+        match self.agenda.as_ref().filter(|snapshot| snapshot.date == selected) {
+            None => {
+                items = items.push(popup::detail("Loading events…", ctx));
+            }
+            Some(AgendaSnapshot { events: Ok(events), .. }) if events.is_empty() => {
+                items = items.push(popup::detail("No events", ctx));
+            }
+            Some(AgendaSnapshot { events: Ok(events), .. }) => {
+                for event in events {
+                    items = items.push(
+                        popup::lines()
+                            .width(Length::Shrink)
+                            .push(popup::detail(event.time.as_str(), ctx))
+                            .push(
+                                popup::item(event.title.as_str(), ctx)
+                                    .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph),
+                            ),
+                    );
+                }
+            }
+            Some(AgendaSnapshot { events: Err(error), .. }) => {
+                items = items
+                    .push(
+                        popup::item("Calendar unavailable", ctx)
+                            .class(cosmic::theme::Text::Color(ctx.palette.red)),
+                    )
+                    .push(
+                        popup::detail(error.as_str(), ctx)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph),
+                    )
+                    .push(popup::detail("Reconnecting…", ctx));
+            }
+        }
+        // The grid keeps its native cell size. Only agenda text wraps when the
+        // popup's maximum width is reached; short text is measured, not padded
+        // out to the cap. The scrollbar claims space only when needed.
+        let events = widget::scrollable(items)
+            .width(Length::Shrink)
+            .height(Length::Shrink)
+            .scrollbar_width(6.0)
+            .scroller_width(6.0)
+            .spacing(2.0)
+            .class(cosmic::theme::iced::Scrollable::Minimal)
+            .apply(widget::container)
+            .max_height(240.0)
+            .width(Length::Shrink);
+        popup::column()
+            .width(Length::Shrink)
+            .push(
+                popup::lines()
+                    .width(Length::Shrink)
+                    .push(popup::title(
+                        if selected == today { "Today".to_owned() } else { numeric_date(selected) },
+                        ctx,
+                    ))
+                    .push(popup::detail("GNOME Calendar", ctx)),
+            )
+            .push(events)
+            .max_width(
+                crate::bar::CALENDAR_MAX_WIDTH
+                    - CALENDAR_WIDTH
+                    - AGENDA_GAP
+                    - 2.0 * popup::PAD_X,
+            )
+            .into()
     }
 
     pub fn fast_tick(&self, _open: bool) -> bool {
@@ -262,8 +377,34 @@ impl State {
     }
 }
 
+/// Dropping the popup drops this worker; opening it always queries immediately.
+fn agenda_stream(date: &Date) -> impl Stream<Item = Message> + use<> {
+    let date = *date;
+    cosmic::iced::stream::channel(1, async move |mut sender| {
+        if sender.send(event_message(Event::AgendaLoading(date))).await.is_err() {
+            return;
+        }
+        let snapshots = agenda::watch(date);
+        futures::pin_mut!(snapshots);
+        while let Some(snapshot) = snapshots.next().await {
+            if sender
+                .send(event_message(Event::AgendaLoaded(AgendaSnapshot {
+                    date: snapshot.date,
+                    events: snapshot.events,
+                })))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
 const DAY_SIZE: f32 = 28.0;
 const DAY_GAP: f32 = 4.0;
+const CALENDAR_WIDTH: f32 = 7.0 * DAY_SIZE + 6.0 * DAY_GAP;
+const AGENDA_GAP: f32 = 24.0;
 const DAY_RADIUS: f32 = 7.0;
 const CALENDAR_APP: &str = "gnome-calendar";
 
@@ -427,6 +568,27 @@ fn spawn_calendar(date: Date) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_agenda_updates_do_not_replace_the_selected_days_events() {
+        let today = Date::new(2026, 9, 9).unwrap();
+        let selected = Date::new(2026, 9, 17).unwrap();
+        let mut state = State::at(today);
+        drop(state.update(Event::Select(selected)));
+        drop(state.update(Event::AgendaLoaded(AgendaSnapshot {
+            date: selected,
+            events: Ok(Vec::new()),
+        })));
+        drop(state.update(Event::AgendaLoaded(AgendaSnapshot {
+            date: today,
+            events: Err("Old request failed".to_owned()),
+        })));
+        drop(state.update(Event::AgendaLoading(today)));
+
+        let snapshot = state.agenda.as_ref().expect("selected agenda remains loaded");
+        assert_eq!(snapshot.date, selected);
+        assert!(snapshot.events.as_ref().unwrap().is_empty());
+    }
+
 
     #[test]
     fn untouched_calendar_advances_to_current_weekday() {

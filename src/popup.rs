@@ -137,26 +137,46 @@ impl<'a> Card<'a> {
     }
 
     pub fn build(self) -> Element<'a, Message> {
-        let mut card = widget::Column::new().width(Length::Fill);
+        self.build_with_width(Length::Fill)
+    }
+
+    /// Measure each block at its intrinsic width; dividers span the widest one.
+    /// Unlike a normal fill card, this does not turn an autosize cap into a width.
+    pub fn build_fit(self) -> Element<'a, Message> {
+        self.build_with_width(Length::Shrink)
+    }
+
+    fn build_with_width(self, width: Length) -> Element<'a, Message> {
+        let mut card = widget::Column::new();
         for (index, block) in self.blocks.into_iter().enumerate() {
             if index > 0 {
                 card = card.push(widget::divider::horizontal::default());
             }
             card = card.push(match block {
-                Block::Padded(content) => content
-                    .apply(widget::container)
-                    .padding(Padding {
-                        top: PAD_Y,
-                        right: PAD_X,
-                        bottom: PAD_Y,
-                        left: PAD_X,
-                    })
-                    .width(Length::Fill)
-                    .into(),
-                Block::List(content) => scroll(content),
+                Block::Padded(content) => {
+                    // Fill rows use the width measured from intrinsic blocks.
+                    let block_width = if width == Length::Shrink {
+                        content.as_widget().size().width
+                    } else {
+                        width
+                    };
+                    content
+                        .apply(widget::container)
+                        .padding(Padding {
+                            top: PAD_Y,
+                            right: PAD_X,
+                            bottom: PAD_Y,
+                            left: PAD_X,
+                        })
+                        .width(block_width)
+                        .into()
+                }
+                Block::List(content) => scroll(content, LIST_HEIGHT),
             });
         }
-        card.into()
+        // Pushing a Fill divider promotes the column's inferred width to Fill.
+        // Apply the requested width last so fit cards measure their blocks.
+        card.width(width).into()
     }
 }
 
@@ -174,10 +194,10 @@ impl<'a> Card<'a> {
 /// `Length::Shrink` on the scrollable is what makes the card fit its content:
 /// iced lays a vertical scrollable's content out with no height limit at all
 /// and then resolves the scrollable itself against the limit it was given, so
-/// the region is `min(content, LIST_HEIGHT)` tall and scrolls exactly when that
+/// the region is `min(content, max_height)` tall and scrolls exactly when that
 /// cap bites. The cap has to arrive as a limit from outside, which is what the
 /// wrapping container is for.
-fn scroll<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+pub fn scroll<'a>(content: Element<'a, Message>, max_height: f32) -> Element<'a, Message> {
     content
         .apply(widget::container)
         .padding(Padding {
@@ -197,7 +217,7 @@ fn scroll<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
         .height(Length::Shrink)
         .width(Length::Fill)
         .apply(widget::container)
-        .max_height(LIST_HEIGHT)
+        .max_height(max_height)
         .width(Length::Fill)
         .into()
 }

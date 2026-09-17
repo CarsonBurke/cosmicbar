@@ -40,7 +40,7 @@ for anything that is not a label.
   the buttons that belong to another program (`walker`, `nmtui`, `bluetoothctl`,
   the upgrade, your locker) hand off to it instead of reimplementing it.
 - **Cheap.** Both bars running on the same desktop for 150s
-  (`contrib/measure-bar.py`): **0.28% CPU against waybar's 2.43%**, and 59 MB RSS
+  (`cargo run --release --example measure-bar -- target/release/cosmicbar mine 150`): **0.28% CPU against waybar's 2.43%**, and 59 MB RSS
   against 28 MB at the end of the window. It trades memory for CPU - one process
   with a GPU-less renderer and its own font atlas, instead of GTK plus a script
   per module.
@@ -51,12 +51,13 @@ for anything that is not a label.
 ## Install
 
 ```bash
-cargo install --path .            # ~/.cargo/bin/cosmicbar
+cargo install --path . --locked   # cosmicbar, cosmicbar-calendar, cosmicbar-mlq
 ```
 
-Rust 1.93+, a Wayland session, and `libpulse` and `libxkbcommon` at build time;
-libcosmic itself is fetched from git. The bar inherits the system interface font
-for text and uses `CommitMono Nerd Font Mono` for Nerd Font icons.
+Rust 1.93+, a Wayland session, `libpulse`, `libxkbcommon`, Evolution Data Server
+development libraries, `pkg-config`, and libclang at build time; libcosmic itself
+is fetched from git. The bar inherits the system interface font for text and
+uses `CommitMono Nerd Font Mono` for Nerd Font icons.
 
 Start it from your compositor:
 
@@ -95,7 +96,7 @@ Placing a module is what starts its subscription; leaving it out costs nothing.
 | module | cell | fed by |
 | --- | --- | --- |
 | `time` | clock | the bar's own tick |
-| `date` | date, calendar popup | system clock |
+| `date` | date, month grid and today's GNOME Calendar events | system clock, Evolution Data Server |
 | `workspaces` | per-output pills, click to focus | niri IPC events |
 | `taskbar` | this output's windows | niri IPC events |
 | `cpu` | package temperature, usage, per-core popup | `/proc/stat`, hwmon |
@@ -116,6 +117,24 @@ Placing a module is what starts its subscription; leaving it out costs nothing.
 
 Three cells have nothing to open: `workspaces` and `idle_inhibitor` act on the
 click itself, and `time` says all it has to say in the bar.
+
+The calendar popup shows the selected date's events beside the month grid, using
+the enabled, selected calendars shared with GNOME Calendar. Clicking a date or
+browsing months loads that day's agenda. While open, it subscribes to event and
+calendar-selection changes; closing the popup stops the subscription. The date
+follows local midnight until you choose one; “today” restores that behavior.
+The popup fits its content, with wrapping and scrolling for long event lists.
+Recurring events, exceptions and timezones are resolved by Evolution Data Server.
+The popup-scoped `cosmicbar-calendar` Rust worker links directly to Evolution
+Data Server (`evolution-data-server` on Arch); no interpreter or GI runtime is
+used. Configure accounts and calendar visibility in GNOME Calendar. If the
+backend is unavailable, the date grid still works and the agenda shows an error.
+The updates module is independent of Pamac and its tray: it uses `checkupdates`
+and an installed AUR helper.
+
+The tray hosts its own StatusNotifierWatcher or uses an existing one, including
+KDE's. Watcher unregister signals remove exited apps and withdrawn items
+immediately, without polling; removing the selected item also closes its menu.
 
 ## Popups from a keybind
 
@@ -138,12 +157,15 @@ right = ["extension:mlq", "volume", "power"]
 
 [[extensions]]
 name = "mlq"
-command = ["/home/you/.local/bin/cosmicbar-mlq"]
+command = ["cosmicbar-mlq"]
 ```
 
-`contrib/extensions/cosmicbar-mlq` is a working one in dependency-free Python:
-it subscribes to a local ML job queue and gives the bar a cell plus a popup with
-per-job cancel buttons - the second screenshot above. Protocol:
+`cosmicbar-mlq` is a bundled native Rust extension: it subscribes to a local ML
+job queue and gives the bar a cell plus a popup with per-job cancel buttons -
+the second screenshot above. Install it with
+`cargo install --path . --bin cosmicbar-mlq` and ensure Cargo's bin directory is
+on the bar's `PATH`, or configure the installed binary's absolute path. Source:
+[`src/bin/cosmicbar-mlq.rs`](src/bin/cosmicbar-mlq.rs). Protocol:
 [docs/extensions.md](docs/extensions.md).
 
 ## Compositor support

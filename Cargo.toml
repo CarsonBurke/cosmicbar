@@ -3,6 +3,7 @@ name = "cosmicbar"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
+default-run = "cosmicbar"
 description = "A libcosmic layer-shell status bar for niri: push-driven modules, real widgets, clickable popups"
 license = "MIT"
 
@@ -51,3 +52,11 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+
+[dev-dependencies]
+ttf-parser = "0.25"
+libc = "0.2"

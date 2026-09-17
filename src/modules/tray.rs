@@ -7,9 +7,9 @@
 //! watcher; the moment that owner goes away the name falls to us. Either way
 //! no external daemon is needed.
 //!
-//! Everything is push: `system-tray` turns the item and menu protocols into a
-//! broadcast stream of property changes, so items appear, change icon and
-//! vanish without the bar ever asking.
+//! Event-driven: `system-tray` supplies item and menu property changes; the
+//! watcher supplies removals. Discovery checks the registry once before
+//! publishing an item, so a delayed property reply cannot resurrect it.
 //!
 //! Interaction, mirroring the waybar tray plus what waybar could not do:
 //! left click activates an item, middle click is its secondary activation,
@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use cosmic::app::Task;
-use cosmic::iced::futures::{SinkExt, Stream};
+use cosmic::iced::futures::{SinkExt, Stream, StreamExt};
 use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::widget::{self, icon};
 use cosmic::{Apply, Element};
@@ -38,6 +38,9 @@ use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
 use crate::popup::{self, Card, Chip};
 use crate::theme::Island;
+
+#[cfg(test)]
+mod tests;
 
 /// waybar painted the tray island `@tray`, which is `@mantle`.
 pub const ISLAND: Island = Island::Join;
@@ -117,7 +120,10 @@ pub enum Event {
     /// Popup: expand or collapse a submenu.
     ToggleSubmenu(i32),
     /// Popup: a menu entry was clicked.
-    MenuClick { address: Arc<str>, id: i32 },
+    MenuClick {
+        address: Arc<str>,
+        id: i32,
+    },
     /// Result of a request, so a failure is visible instead of silent.
     Requested(Result<(), String>),
 }
@@ -127,7 +133,7 @@ pub enum Event {
 /// handles are rebuilt only when the properties behind them change.
 #[derive(Debug)]
 struct Item {
-    /// Unique bus name the item lives on; also its identity here.
+    /// Bus name the item registered under; also its identity here.
     address: Arc<str>,
     id: String,
     title: Option<String>,
@@ -234,10 +240,7 @@ impl State {
                 // The active selector stays pressable so its accent style is
                 // not replaced by iced's disabled style. Treating that styling
                 // click as a real selection would collapse open submenus.
-                if self
-                    .target()
-                    .is_some_and(|item| item.address == address)
-                {
+                if self.target().is_some_and(|item| item.address == address) {
                     return Task::none();
                 }
                 self.expanded.clear();
@@ -521,8 +524,8 @@ impl State {
                 continue;
             }
 
-            let has_submenu = !entry.submenu.is_empty()
-                || entry.children_display.as_deref() == Some("submenu");
+            let has_submenu =
+                !entry.submenu.is_empty() || entry.children_display.as_deref() == Some("submenu");
             let expanded = has_submenu && self.expanded.contains(&entry.id);
             let color = match (entry.enabled, entry.disposition) {
                 (false, _) => palette.overlay0,
@@ -1031,6 +1034,9 @@ trait TrayItem {
 trait Watcher {
     #[zbus(property)]
     fn registered_status_notifier_items(&self) -> zbus::Result<Vec<String>>;
+
+    #[zbus(signal)]
+    fn status_notifier_item_unregistered(&self, service: &str) -> zbus::Result<()>;
 }
 
 /// The object path an item registered under, defaulting to the path the spec
@@ -1065,6 +1071,19 @@ async fn item_path(connection: &zbus::Connection, address: &str) -> String {
         .unwrap_or_else(|| ITEM_OBJECT.to_owned())
 }
 
+/// Match the client's bus-name keys to the watcher's bus-name/path entries.
+fn item_address(service: &str) -> &str {
+    service.split_once('/').map_or(service, |(name, _)| name)
+}
+
+async fn item_is_registered(watcher: &WatcherProxy<'_>, address: &str) -> zbus::Result<bool> {
+    Ok(watcher
+        .registered_status_notifier_items()
+        .await?
+        .iter()
+        .any(|service| item_address(service) == address))
+}
+
 /// A host that re-registers itself if the session bus or the watcher restarts.
 fn stream() -> impl Stream<Item = Event> {
     cosmic::iced::stream::channel(16, async move |mut sender| {
@@ -1091,27 +1110,41 @@ fn stream() -> impl Stream<Item = Event> {
 async fn session(
     sender: &mut cosmic::iced::futures::channel::mpsc::Sender<Event>,
 ) -> anyhow::Result<()> {
-    let client = Arc::new(Client::new().await?);
+    // Watch removal before starting item discovery. system-tray 0.8 compares
+    // NameOwnerChanged's unique owner to the registered name, so it misses
+    // KDE's well-known names and items unregistered on a still-live connection.
     // `Client` keeps its own connection private, and the bar needs one to call
     // items back on.
     let connection = zbus::Connection::session().await?;
+    let watcher = WatcherProxy::builder(&connection)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let mut removed = watcher.receive_status_notifier_item_unregistered().await?;
+    let client = Arc::new(Client::new().await?);
     // Subscribe before reading the current items, so an item that registers
     // during the handover is seen exactly once.
     let mut events = client.subscribe();
     if sender
         .send(Event::Connected(Host {
             client: client.clone(),
-            connection,
+            connection: connection.clone(),
         }))
         .await
         .is_err()
     {
         return Ok(());
     }
-    let known: Vec<(Arc<str>, StatusNotifierItem, Option<TrayMenu>)> = client
-        .items()
+    let items = client.items();
+    let registered = watcher.registered_status_notifier_items().await?;
+    let known: Vec<(Arc<str>, StatusNotifierItem, Option<TrayMenu>)> = items
         .lock()
-        .map(|items| {
+        .map(|mut items| {
+            items.retain(|address, _| {
+                registered
+                    .iter()
+                    .any(|service| item_address(service) == address)
+            });
             items
                 .iter()
                 .map(|(address, (item, menu))| {
@@ -1136,8 +1169,33 @@ async fn session(
     }
 
     loop {
-        match events.recv().await {
+        let event = tokio::select! {
+            signal = removed.next() => {
+                let Some(signal) = signal else {
+                    anyhow::bail!("tray watcher removal stream ended");
+                };
+                let args = signal.args()?;
+                let address = item_address(args.service());
+                if let Ok(mut items) = items.lock() {
+                    items.remove(address);
+                }
+                if sender.send(Event::Removed(Arc::from(address))).await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            event = events.recv() => event,
+        };
+        match event {
             Ok(ClientEvent::Add(address, item)) => {
+                // Property discovery runs asynchronously in system-tray: an
+                // Add can arrive after its unregister signal was processed.
+                if !item_is_registered(&watcher, &address).await? {
+                    if let Ok(mut items) = items.lock() {
+                        items.remove(&address);
+                    }
+                    continue;
+                }
                 if sender
                     .send(Event::Added(address.into(), item))
                     .await

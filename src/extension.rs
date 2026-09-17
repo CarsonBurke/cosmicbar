@@ -24,8 +24,8 @@
 //!
 //! The protocol is a drawing contract, not a widget toolkit: colours are palette
 //! roles rather than hex, so an extension inherits the bar's theme, and the only
-//! interactive element is a labelled button on a popup row. `contrib/extensions`
-//! holds a working example.
+//! interactive element is a labelled button on a popup row.
+//! `src/bin/cosmicbar-mlq.rs` holds a working native example.
 
 use std::sync::Arc;
 use std::time::Duration;

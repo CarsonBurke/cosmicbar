@@ -67,8 +67,8 @@ async fn read_exactly(socket: &mut UnixStream, bytes: &mut [u8], timed: bool) ->
     let mut read = 0;
     while read < bytes.len() {
         let operation = socket.read(&mut bytes[read..]);
-        let result = if timed {self::
-            timeout(Duration::from_secs(5), operation).await?
+        let result = if timed {
+            self::timeout(Duration::from_secs(5), operation).await?
         } else {
             operation.await
         };

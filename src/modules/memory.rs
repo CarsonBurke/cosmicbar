@@ -7,6 +7,8 @@
 //! (waybar polled at 10s), on a blocking thread because the popup's
 //! process list opens `/proc/<pid>/statm` for every process.
 
+mod origin;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +113,7 @@ impl Sample {
 #[derive(Debug)]
 struct TopProcess {
     pid: u32,
-    name: String,
+    origin: origin::Origin,
     rss_bytes: u64,
 }
 
@@ -271,10 +273,14 @@ impl State {
                 .max(1);
             let mut block = popup::column().push(popup::section("processes", ctx));
             for process in &sample.top {
+                // Which script, which project, launched by what: five rows of
+                // `python` would say nothing about whose memory this is.
+                let context = (!process.origin.context.is_empty())
+                    .then(|| popup::detail(process.origin.context.join(" · "), ctx));
                 block = block.push(
                     popup::lines()
                         .push(popup::split(
-                            popup::item(process.name.as_str(), ctx),
+                            popup::item(process.origin.name.as_str(), ctx),
                             [
                                 popup::detail(format!("{}", process.pid), ctx)
                                     .class(cosmic::theme::Text::Color(palette.overlay0))
@@ -287,6 +293,7 @@ impl State {
                                 .into(),
                             ],
                         ))
+                        .push_maybe(context)
                         .push(bar(
                             process.rss_bytes as f32 / largest as f32,
                             palette.mauve,
@@ -483,11 +490,9 @@ fn top_processes() -> Vec<TopProcess> {
         .into_iter()
         .map(|(pid, rss_bytes)| TopProcess {
             pid,
-            // Read only for the few winners: one extra open per process would
-            // double the syscalls for a list that shows five names.
-            name: std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                .map(|name| name.trim().to_string())
-                .unwrap_or_else(|_| format!("[{pid}]")),
+            // Read only for the few winners: the four extra reads per process
+            // would multiply the syscalls for a list that shows five names.
+            origin: origin::identify(pid),
             rss_bytes,
         })
         .collect()

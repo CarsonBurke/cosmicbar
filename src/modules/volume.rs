@@ -362,7 +362,7 @@ impl State {
             ),
         );
 
-        // Right-click (mute) is the bar's own, from `modules::right_click`, so
+        // Right-click (mute) is the bar's own, from `Modules::right_click`, so
         // every cell answers the same button the same way.
         Some(Pointer::new(row.into()).on_wheel(wheel).wrap())
     }

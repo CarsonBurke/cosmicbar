@@ -146,7 +146,7 @@ impl cosmic::Application for Bar {
                 tracker: None,
                 rects: HashMap::new(),
             },
-            Task::none(),
+            modules::brightness::State::load_modes(),
         )
     }
 
@@ -183,6 +183,12 @@ impl cosmic::Application for Bar {
             }
             Message::Control(crate::control::Command::Close) => self.close_popup(),
             Message::Control(crate::control::Command::Reload) => self.reload(),
+            Message::Control(crate::control::Command::BrightnessMode(name)) => {
+                self.modules.brightness.update(match name {
+                    Some(name) => modules::brightness::Event::ApplyNamed(name),
+                    None => modules::brightness::Event::CycleMode,
+                })
+            }
             Message::ClosePopup => self.close_popup(),
             Message::PopupEvent(cosmic::iced::event::wayland::PopupEvent::Done, id) => {
                 // The compositor already destroyed it; only our state is stale.
@@ -409,7 +415,8 @@ impl Bar {
     fn reload(&mut self) -> Task<Message> {
         let previous = std::mem::replace(&mut self.config, Config::load());
         self.modules.sync_extensions(&self.config);
-        let mut tasks = Vec::new();
+        // The brightness modes file is edited by hand as well as by the popup.
+        let mut tasks = vec![modules::brightness::State::load_modes()];
 
         if self
             .popup
@@ -703,7 +710,9 @@ impl Bar {
             // of its own gets its popup, which is how the window list stays
             // reachable now that the taskbar strip is nothing but items, each
             // eating its own left click.
-            let on_right = modules::right_click(id)
+            let on_right = self
+                .modules
+                .right_click(id)
                 .or_else(|| clickable.then(|| Message::Toggle(surface, id)));
             let cell: Element<'a, Message> = match on_right {
                 Some(message) => modules::pointer::Pointer::new(cell)

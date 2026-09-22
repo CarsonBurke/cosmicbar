@@ -19,7 +19,12 @@
 //!   rendered from the cache, writes are coalesced per display (a slider drag
 //!   issues one write at a time, always with the newest value), and live re-reads
 //!   only happen while the popup is open.
+//!
+//! Named modes (`day`, `night`) store a level per display; see [`modes`].
 
+mod modes;
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +50,19 @@ const STEP: u32 = 5;
 const NUDGE_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Presets offered in the popup.
 const PRESETS: [u32; 5] = [10, 25, 50, 75, 100];
+/// nf-md-theme_light_dark: step to the next mode.
+const ICON_CYCLE: &str = "\u{f050e}";
+/// nf-md-plus: save the current levels as a new mode.
+const ICON_ADD: &str = "\u{f0415}";
+/// nf-md-pencil
+const ICON_EDIT: &str = "\u{f03eb}";
+/// nf-md-delete
+const ICON_DELETE: &str = "\u{f01b4}";
+/// nf-md-close: leave the editor without saving.
+const ICON_CANCEL: &str = "\u{f0156}";
+/// nf-md-radiobox_marked / nf-md-radiobox_blank: the mode in effect.
+const ICON_ACTIVE: &str = "\u{f043e}";
+const ICON_INACTIVE: &str = "\u{f043d}";
 /// A wedged i2c bus must not pin a task forever.
 const DDC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-read interval while the popup is open, so a change made elsewhere shows up.
@@ -65,6 +83,18 @@ pub enum Sink {
     Ddc { bus: u32, max: u32 },
 }
 
+impl Sink {
+    /// The hardware value `percent` is written as. Two levels are the same
+    /// brightness on this display exactly when these agree: a panel with eight
+    /// steps reads 30% back as 29%.
+    fn raw(&self, percent: u32) -> u32 {
+        match self {
+            Self::Backlight { max, .. } => from_percent(percent.max(SYSFS_FLOOR), *max),
+            Self::Ddc { max, .. } => from_percent(percent, *max),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Found {
     sink: Sink,
@@ -74,6 +104,14 @@ pub struct Found {
     /// and scroll the display it is actually drawn on.
     connector: Option<String>,
     percent: u32,
+}
+
+impl Found {
+    /// What a mode calls this display: its connector, which is stable across
+    /// replugs and matches the compositor's name for it, or else its label.
+    fn key(&self) -> &str {
+        self.connector.as_deref().unwrap_or(&self.label)
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +141,34 @@ pub enum Event {
         percent: u32,
         result: Result<(), String>,
     },
+    /// The saved modes, read at startup and on `cosmicbar reload`.
+    ModesLoaded(Result<Arc<modes::Loaded>, String>),
+    ApplyMode(usize),
+    /// `cosmicbar brightness-mode <name>`.
+    ApplyNamed(String),
+    /// Step to the mode after the one in effect.
+    CycleMode,
+    /// Open the editor on a new mode, which will hold the current levels.
+    NewMode,
+    /// Apply a mode and open it in the editor: the sliders are how its levels
+    /// are changed.
+    EditMode(usize),
+    /// Text typed into the editor's name.
+    Typed(String),
+    /// Backspace; with Ctrl, the whole last word.
+    Erase { word: bool },
+    SaveMode,
+    DeleteMode,
+    CancelEdit,
+    Saved(Result<(), String>),
+}
+
+/// A mode being named, and what saving it will replace.
+#[derive(Debug)]
+struct Editor {
+    /// The mode being edited, or `None` for a new one.
+    target: Option<usize>,
+    name: String,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +177,19 @@ pub struct State {
     /// When the last wheel notch was accepted; see [`NUDGE_DEBOUNCE`].
     nudged_at: Option<Instant>,
     error: Option<String>,
+    modes: Vec<modes::Mode>,
+    /// False until the modes file has been read, and while it cannot be: a
+    /// save then would overwrite whatever made it unreadable — a hand edit
+    /// half done — so editing waits for a `cosmicbar reload` that reads it.
+    modes_readable: bool,
+    /// Why the modes file could not be read or written.
+    modes_error: Option<String>,
+    /// The mode applied last, so cycling from levels that match no mode still
+    /// moves on from where it was rather than starting over.
+    last_mode: Option<usize>,
+    editor: Option<Editor>,
+    /// Bumped per edit; orders the writes, see [`modes::save`].
+    saves: u64,
 }
 
 impl State {
@@ -123,12 +202,20 @@ impl State {
             // Nobody is looking, and a DDC read costs a third of a second.
             return Subscription::none();
         }
+        // Typing only means something while the editor is on screen.
+        let typing = match self.editor {
+            Some(_) => cosmic::iced::event::listen_with(keys),
+            None => Subscription::none(),
+        };
         let sinks: Vec<Sink> = self
             .displays
             .iter()
             .map(|display| display.found.sink.clone())
             .collect();
-        Subscription::run_with(sinks, |sinks| refresh(sinks.clone()))
+        Subscription::batch([
+            Subscription::run_with(sinks, |sinks| refresh(sinks.clone())),
+            typing,
+        ])
     }
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
@@ -180,6 +267,156 @@ impl State {
                 self.apply(target, |current| {
                     (current as i32 + delta).clamp(0, 100) as u32
                 })
+            }
+            Event::ModesLoaded(Ok(loaded)) => {
+                let modes::Loaded { modes, generation } = Arc::unwrap_or_clone(loaded);
+                // Read before an edit's save ran: the save writes what is
+                // here already, over what was read.
+                if generation < self.saves {
+                    return Task::none();
+                }
+                // A save that failed left edits only in memory; the file is
+                // the truth now, but say where they went.
+                let unsaved = self.modes_readable.then_some(()).and(self.modes_error.take());
+                self.modes_readable = true;
+                // `cosmicbar reload` follows every config.toml save; only a
+                // changed file disturbs the editor and the cycling position.
+                if modes != self.modes {
+                    self.modes_error = unsaved
+                        .map(|error| format!("{error}; unsaved changes were replaced by the file"));
+                    self.modes = modes;
+                    self.last_mode = None;
+                    // The list may have been reordered under an open editor.
+                    if self.editor.as_ref().is_some_and(|editor| editor.target.is_some()) {
+                        self.editor = None;
+                    }
+                }
+                Task::none()
+            }
+            Event::ModesLoaded(Err(error)) => {
+                log::warn!("brightness modes: {error}");
+                self.modes_readable = false;
+                self.modes_error = Some(error);
+                self.editor = None;
+                Task::none()
+            }
+            Event::ApplyMode(index) => self.apply_mode(index),
+            Event::ApplyNamed(name) => {
+                let name = name.trim();
+                match self
+                    .modes
+                    .iter()
+                    .position(|mode| mode.name.trim().eq_ignore_ascii_case(name))
+                {
+                    Some(index) => self.apply_mode(index),
+                    None => {
+                        log::warn!("no brightness mode named `{name}`");
+                        Task::none()
+                    }
+                }
+            }
+            Event::CycleMode => {
+                if self.modes.is_empty() {
+                    return Task::none();
+                }
+                let next = self
+                    .active_mode()
+                    .or(self.last_mode)
+                    .map_or(0, |index| (index + 1) % self.modes.len());
+                self.apply_mode(next)
+            }
+            Event::NewMode => {
+                if !self.modes_readable {
+                    return Task::none();
+                }
+                self.editor = Some(Editor {
+                    target: None,
+                    name: String::new(),
+                });
+                Task::none()
+            }
+            Event::EditMode(index) => {
+                let Some(mode) = self.modes.get(index).filter(|_| self.modes_readable) else {
+                    return Task::none();
+                };
+                self.editor = Some(Editor {
+                    target: Some(index),
+                    name: mode.name.clone(),
+                });
+                self.apply_mode(index)
+            }
+            Event::Typed(text) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.name.extend(text.chars().filter(|c| !c.is_control()));
+                }
+                Task::none()
+            }
+            Event::Erase { word } => {
+                if let Some(editor) = &mut self.editor {
+                    match word {
+                        true => {
+                            let kept = editor.name.trim_end().rfind(' ').map_or(0, |at| at + 1);
+                            editor.name.truncate(kept);
+                        }
+                        false => {
+                            editor.name.pop();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Event::SaveMode => {
+                // An unsaveable draft stays open to be fixed.
+                let Some(name) = self.draft_name() else {
+                    return Task::none();
+                };
+                let Some(editor) = self.editor.take() else {
+                    return Task::none();
+                };
+                let levels = self.levels();
+                match editor.target.filter(|index| *index < self.modes.len()) {
+                    Some(index) => {
+                        let mode = &mut self.modes[index];
+                        mode.name = name;
+                        // A display that is unplugged right now keeps the
+                        // level the mode already had for it.
+                        mode.levels.extend(levels);
+                        self.last_mode = Some(index);
+                    }
+                    None => {
+                        self.modes.push(modes::Mode { name, levels });
+                        self.last_mode = Some(self.modes.len() - 1);
+                    }
+                }
+                self.save()
+            }
+            Event::DeleteMode => {
+                let Some(index) = self
+                    .editor
+                    .take()
+                    .and_then(|editor| editor.target)
+                    .filter(|index| *index < self.modes.len())
+                else {
+                    return Task::none();
+                };
+                self.modes.remove(index);
+                // Opening the editor applied the mode, so it was the last one.
+                self.last_mode = None;
+                self.save()
+            }
+            Event::CancelEdit => {
+                self.editor = None;
+                Task::none()
+            }
+            Event::Saved(result) => {
+                match result {
+                    Ok(()) => self.modes_error = None,
+                    Err(error) => {
+                        log::warn!("brightness modes: {error}");
+                        self.modes_error = Some(error);
+                    }
+                }
+                Task::none()
             }
             Event::Wrote {
                 index,
@@ -266,7 +503,8 @@ impl State {
         // The presets move every display at once, which is what makes them the
         // card's footer rather than a control inside one display's block.
         Some(
-            card.block(popup::split(
+            card.block(self.modes_block(ctx))
+                .block(popup::split(
                 popup::detail("all", ctx),
                 PRESETS.map(|preset| {
                     popup::chip(
@@ -287,6 +525,216 @@ impl State {
 
     pub fn fast_tick(&self, _open: bool) -> bool {
         false
+    }
+
+    /// Whether a right-click has a mode to step to.
+    pub fn has_modes(&self) -> bool {
+        !self.modes.is_empty() && !self.displays.is_empty()
+    }
+
+    /// Read the modes file: at startup, and again on `cosmicbar reload`.
+    pub fn load_modes() -> Task<Message> {
+        Task::future(async {
+            let loaded = modes::load().await.map(Arc::new);
+            cosmic::Action::App(event_message(Event::ModesLoaded(loaded)))
+        })
+    }
+
+    /// The modes, a button to step through them and one to add another, then
+    /// one row per mode — or the editor, in place of the mode it is editing.
+    fn modes_block<'a>(&'a self, ctx: &Ctx) -> Element<'a, Message> {
+        let palette = ctx.palette;
+        let active = self.active_mode();
+        // One edit at a time, and none while the file cannot be trusted.
+        let editable = self.modes_readable && self.editor.is_none();
+        let editing = self.editor.as_ref().map(|editor| editor.target);
+
+        let mut block = popup::column().push(popup::split(
+            popup::section("modes", ctx),
+            [
+                popup::icon_chip(
+                    ICON_CYCLE,
+                    Chip::Plain,
+                    ctx,
+                    (!self.modes.is_empty()).then(|| event_message(Event::CycleMode)),
+                ),
+                popup::icon_chip(
+                    ICON_ADD,
+                    Chip::Plain,
+                    ctx,
+                    editable.then(|| event_message(Event::NewMode)),
+                ),
+            ],
+        ));
+
+        for (index, mode) in self.modes.iter().enumerate() {
+            if editing == Some(Some(index)) {
+                block = block.push(self.editor_row(ctx));
+                continue;
+            }
+            let (radio, color) = match active == Some(index) {
+                true => (ICON_ACTIVE, palette.accent()),
+                false => (ICON_INACTIVE, palette.muted()),
+            };
+            let label = widget::Row::new()
+                .push(
+                    crate::theme::icon_text(radio)
+                        .size(ctx.small())
+                        .class(cosmic::theme::Text::Color(color)),
+                )
+                .push(
+                    popup::lines()
+                        .push(
+                            popup::item(mode.name.as_str(), ctx)
+                                .class(cosmic::theme::Text::Color(color)),
+                        )
+                        .push(popup::detail(mode.summary(), ctx)),
+                )
+                .spacing(popup::ROW_GAP)
+                .align_y(cosmic::iced::Alignment::Center);
+            block = block.push(popup::split(
+                popup::row(
+                    label,
+                    palette,
+                    Some(event_message(Event::ApplyMode(index))),
+                ),
+                [popup::icon_chip(
+                    ICON_EDIT,
+                    Chip::Plain,
+                    ctx,
+                    editable.then(|| event_message(Event::EditMode(index))),
+                )],
+            ));
+        }
+        if editing == Some(None) {
+            block = block.push(self.editor_row(ctx));
+        } else if self.modes.is_empty() && self.modes_readable {
+            block = block.push(popup::detail(
+                "set the sliders, then + saves them as a mode",
+                ctx,
+            ));
+        }
+        block
+            .push_maybe(self.modes_error.as_ref().map(|error| {
+                popup::detail(error.as_str(), ctx)
+                    .class(cosmic::theme::Text::Color(palette.red))
+            }))
+            .into()
+    }
+
+    /// The name field and its verbs, over the levels saving will store.
+    fn editor_row<'a>(&'a self, ctx: &Ctx) -> Element<'a, Message> {
+        let Some(editor) = &self.editor else {
+            return widget::Row::new().into();
+        };
+        let save = self.draft_name().map(|_| event_message(Event::SaveMode));
+        let mut actions = vec![popup::chip("save", Chip::Accent, ctx, save)];
+        if editor.target.is_some() {
+            actions.push(popup::icon_chip(
+                ICON_DELETE,
+                Chip::Danger,
+                ctx,
+                Some(event_message(Event::DeleteMode)),
+            ));
+        }
+        actions.push(popup::icon_chip(
+            ICON_CANCEL,
+            Chip::Plain,
+            ctx,
+            Some(event_message(Event::CancelEdit)),
+        ));
+        let levels = self.levels();
+        popup::lines()
+            .push(popup::split(
+                popup::field(editor.name.as_str(), "mode name", ctx),
+                actions,
+            ))
+            .push(popup::detail(
+                format!(
+                    "saves {}",
+                    modes::summary(levels.iter().map(|(key, level)| (key.as_str(), *level)))
+                ),
+                ctx,
+            ))
+            .into()
+    }
+
+    /// Every display's level right now, as a mode stores it.
+    fn levels(&self) -> BTreeMap<String, u32> {
+        self.displays
+            .iter()
+            .map(|display| (display.found.key().to_string(), display.found.percent))
+            .collect()
+    }
+
+    /// The mode in effect: the one applied last while it still is, else the
+    /// first that is. Modes can share levels — or one can name a subset of
+    /// another's displays — and cycling has to move on from the one it applied.
+    fn active_mode(&self) -> Option<usize> {
+        self.last_mode
+            .filter(|&index| self.in_effect(index))
+            .or_else(|| (0..self.modes.len()).find(|&index| self.in_effect(index)))
+    }
+
+    /// Whether every display mode `index` names is at its level. A mode that
+    /// names none of the displays present is never in effect.
+    fn in_effect(&self, index: usize) -> bool {
+        let Some(mode) = self.modes.get(index) else {
+            return false;
+        };
+        let mut named = self
+            .displays
+            .iter()
+            .filter_map(|display| {
+                mode.levels
+                    .get(display.found.key())
+                    .map(|level| (&display.found, *level))
+            })
+            .peekable();
+        named.peek().is_some()
+            && named.all(|(found, level)| found.sink.raw(level) == found.sink.raw(found.percent))
+    }
+
+    /// The editor's name, trimmed, when it can be saved: not empty, and not
+    /// another mode's, since `cosmicbar brightness-mode <name>` has to pick one.
+    fn draft_name(&self) -> Option<String> {
+        let editor = self.editor.as_ref()?;
+        let name = editor.name.trim();
+        let taken = self.modes.iter().enumerate().any(|(index, mode)| {
+            Some(index) != editor.target && mode.name.trim().eq_ignore_ascii_case(name)
+        });
+        (!name.is_empty() && !taken).then(|| name.to_string())
+    }
+
+    fn apply_mode(&mut self, index: usize) -> Task<Message> {
+        let Some(mode) = self.modes.get(index) else {
+            return Task::none();
+        };
+        self.last_mode = Some(index);
+        let targets: Vec<(usize, u32)> = self
+            .displays
+            .iter()
+            .enumerate()
+            .filter_map(|(at, display)| {
+                mode.levels
+                    .get(display.found.key())
+                    .map(|level| (at, (*level).min(100)))
+            })
+            .collect();
+        Task::batch(
+            targets
+                .into_iter()
+                .map(|(at, level)| self.apply(Target::One(at), |_| level)),
+        )
+    }
+
+    fn save(&mut self) -> Task<Message> {
+        self.saves += 1;
+        let (modes, generation) = (self.modes.clone(), self.saves);
+        Task::future(async move {
+            let result = modes::save(modes, generation).await;
+            cosmic::Action::App(event_message(Event::Saved(result)))
+        })
     }
 
     /// The display this bar cell speaks for: the one on this output when the
@@ -380,6 +828,39 @@ fn event_message(event: Event) -> Message {
     Message::Module(ModuleEvent::Brightness(event))
 }
 
+/// Keys for the mode editor. They arrive at the bar's layer surface, not the
+/// popup: niri leaves keyboard focus on the layer surface under a grabbing
+/// popup (see [`popup::field`]). Nothing on the bar itself takes keys, so
+/// reading them here while the editor is on screen takes nothing from anyone.
+fn keys(
+    event: cosmic::iced::Event,
+    _status: cosmic::iced::event::Status,
+    _window: cosmic::iced::window::Id,
+) -> Option<Message> {
+    use cosmic::iced::keyboard::{self, key::Named};
+
+    let cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key,
+        modifiers,
+        text,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    let event = match key {
+        keyboard::Key::Named(Named::Enter) => Event::SaveMode,
+        keyboard::Key::Named(Named::Escape) => Event::CancelEdit,
+        keyboard::Key::Named(Named::Backspace) => Event::Erase {
+            word: modifiers.control(),
+        },
+        // Shortcuts are not text, whatever the layout makes of them.
+        _ if modifiers.control() || modifiers.alt() || modifiers.logo() => return None,
+        _ => Event::Typed(text?.to_string()),
+    };
+    Some(event_message(event))
+}
+
 /// How a display introduces itself. The connector leads when the backend knows
 /// one, because `DP-1` is what the compositor and this bar's own per-output
 /// cells call that monitor, and the model beside it is what is printed on the
@@ -470,11 +951,8 @@ async fn get(sink: &Sink) -> anyhow::Result<u32> {
 
 async fn set(sink: &Sink, percent: u32) -> anyhow::Result<()> {
     match sink {
-        Sink::Backlight { name, max } => {
-            let raw = from_percent(percent.max(SYSFS_FLOOR), *max);
-            set_backlight(name, raw).await
-        }
-        Sink::Ddc { bus, max } => ddc_set(*bus, from_percent(percent, *max)).await,
+        Sink::Backlight { name, .. } => set_backlight(name, sink.raw(percent)).await,
+        Sink::Ddc { bus, .. } => ddc_set(*bus, sink.raw(percent)).await,
     }
 }
 
@@ -821,4 +1299,260 @@ trait Login1Manager {
 )]
 trait Login1Session {
     fn set_brightness(&self, subsystem: &str, name: &str, brightness: u32) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display(connector: &str, max: u32, percent: u32) -> Display {
+        Display {
+            found: Found {
+                sink: Sink::Ddc {
+                    bus: connector.len() as u32,
+                    max,
+                },
+                label: format!("{connector} monitor"),
+                connector: Some(connector.to_string()),
+                percent,
+            },
+            pending: None,
+            writing: false,
+        }
+    }
+
+    fn mode(name: &str, levels: &[(&str, u32)]) -> modes::Mode {
+        modes::Mode {
+            name: name.to_string(),
+            levels: levels
+                .iter()
+                .map(|(key, level)| (key.to_string(), *level))
+                .collect(),
+        }
+    }
+
+    /// Two monitors at 80/70, with `day` (80/70) and `night` (20/15) saved.
+    fn state() -> State {
+        let mut state = State {
+            displays: vec![display("DP-1", 100, 80), display("DP-2", 100, 70)],
+            ..State::default()
+        };
+        let _ = state.update(loaded(vec![
+            mode("day", &[("DP-1", 80), ("DP-2", 70)]),
+            mode("night", &[("DP-1", 20), ("DP-2", 15)]),
+        ]));
+        state
+    }
+
+    fn loaded(modes: Vec<modes::Mode>) -> Event {
+        Event::ModesLoaded(Ok(Arc::new(modes::Loaded {
+            modes,
+            generation: 0,
+        })))
+    }
+
+    fn percents(state: &State) -> Vec<u32> {
+        state
+            .displays
+            .iter()
+            .map(|display| display.found.percent)
+            .collect()
+    }
+
+    #[test]
+    fn the_mode_in_effect_is_the_one_every_display_matches() {
+        let mut state = state();
+        assert_eq!(state.active_mode(), Some(0));
+        let _ = state.update(Event::Set(Target::One(0), 81));
+        assert_eq!(state.active_mode(), None);
+    }
+
+    #[test]
+    fn cycling_steps_through_the_modes_and_wraps() {
+        let mut state = state();
+        let _ = state.update(Event::CycleMode);
+        assert_eq!(percents(&state), [20, 15]);
+        assert_eq!(state.active_mode(), Some(1));
+        let _ = state.update(Event::CycleMode);
+        assert_eq!(percents(&state), [80, 70]);
+    }
+
+    #[test]
+    fn cycling_off_a_mode_continues_from_the_last_one_applied() {
+        let mut state = state();
+        let _ = state.update(Event::ApplyMode(1));
+        let _ = state.update(Event::Set(Target::All, 50));
+        let _ = state.update(Event::CycleMode);
+        assert_eq!(state.active_mode(), Some(0));
+    }
+
+    #[test]
+    fn cycling_moves_past_modes_that_share_levels() {
+        let mut state = state();
+        state.modes.insert(1, mode("work", &[("DP-1", 80), ("DP-2", 70)]));
+        state.modes.push(mode("left", &[("DP-1", 80)]));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let _ = state.update(Event::CycleMode);
+            seen.push(state.active_mode());
+        }
+        assert_eq!(seen, [Some(1), Some(2), Some(3), Some(0)]);
+    }
+
+    #[test]
+    fn an_unchanged_reload_keeps_the_editor_and_the_cycle() {
+        let mut state = state();
+        let _ = state.update(Event::ApplyMode(1));
+        let _ = state.update(Event::Set(Target::All, 50));
+        let _ = state.update(Event::EditMode(0));
+        let modes = state.modes.clone();
+        let _ = state.update(loaded(modes));
+        assert!(state.editor.is_some());
+        let _ = state.update(Event::CancelEdit);
+        let _ = state.update(Event::Set(Target::All, 50));
+        let _ = state.update(Event::CycleMode);
+        assert_eq!(state.active_mode(), Some(1));
+        // A changed file may have moved the mode being edited.
+        let _ = state.update(Event::EditMode(1));
+        let _ = state.update(loaded(vec![mode("dusk", &[("DP-1", 40)])]));
+        assert!(state.editor.is_none());
+        assert_eq!(state.modes.len(), 1);
+    }
+
+    #[test]
+    fn a_load_older_than_an_edit_is_ignored() {
+        let mut state = state();
+        let _ = state.update(Event::NewMode);
+        let _ = state.update(Event::Typed("dusk".into()));
+        let _ = state.update(Event::SaveMode);
+        // Read before the save above ran.
+        let _ = state.update(loaded(vec![mode("day", &[("DP-1", 80)])]));
+        assert_eq!(state.modes.len(), 3);
+        // Read after it.
+        let _ = state.update(Event::ModesLoaded(Ok(Arc::new(modes::Loaded {
+            modes: vec![mode("day", &[("DP-1", 80)])],
+            generation: 1,
+        }))));
+        assert_eq!(state.modes.len(), 1);
+    }
+
+    #[test]
+    fn a_reload_after_a_failed_save_says_the_edit_is_gone() {
+        let mut state = state();
+        let _ = state.update(Event::Saved(Err("disk full".into())));
+        let modes = state.modes.clone();
+        let _ = state.update(loaded(modes));
+        assert_eq!(state.modes_error, None, "nothing was lost");
+        let _ = state.update(Event::Saved(Err("disk full".into())));
+        let _ = state.update(loaded(vec![mode("dusk", &[("DP-1", 40)])]));
+        assert!(state.modes_error.as_deref().unwrap().starts_with("disk full; unsaved"));
+    }
+
+    #[test]
+    fn a_mode_is_applied_by_name_whatever_its_case() {
+        let mut state = state();
+        let _ = state.update(Event::ApplyNamed(" Night ".into()));
+        assert_eq!(percents(&state), [20, 15]);
+        let _ = state.update(Event::ApplyNamed("dusk".into()));
+        assert_eq!(percents(&state), [20, 15]);
+    }
+
+    #[test]
+    fn a_display_a_mode_does_not_name_is_left_alone() {
+        let mut state = state();
+        state.modes.push(mode("left only", &[("DP-1", 5)]));
+        let _ = state.update(Event::ApplyMode(2));
+        assert_eq!(percents(&state), [5, 70]);
+        assert_eq!(state.active_mode(), Some(2));
+    }
+
+    #[test]
+    fn a_new_mode_stores_the_current_levels() {
+        let mut state = state();
+        let _ = state.update(Event::Set(Target::All, 40));
+        let _ = state.update(Event::NewMode);
+        let _ = state.update(Event::Typed("  dusk ".into()));
+        let _ = state.update(Event::SaveMode);
+        assert!(state.editor.is_none());
+        assert_eq!(state.modes[2], mode("dusk", &[("DP-1", 40), ("DP-2", 40)]));
+        assert_eq!(state.active_mode(), Some(2));
+        assert_eq!(state.saves, 1);
+    }
+
+    #[test]
+    fn editing_applies_the_mode_and_keeps_levels_for_absent_displays() {
+        let mut state = state();
+        state.modes[1].levels.insert("HDMI-A-1".into(), 30);
+        let _ = state.update(Event::EditMode(1));
+        assert_eq!(percents(&state), [20, 15]);
+        let _ = state.update(Event::Set(Target::One(1), 10));
+        // Ctrl+Backspace clears the one word, then the new name is typed.
+        let _ = state.update(Event::Erase { word: true });
+        let _ = state.update(Event::Typed("late".into()));
+        let _ = state.update(Event::SaveMode);
+        assert_eq!(
+            state.modes[1],
+            mode("late", &[("DP-1", 20), ("DP-2", 10), ("HDMI-A-1", 30)])
+        );
+    }
+
+    #[test]
+    fn a_name_must_be_present_and_not_another_modes() {
+        let mut state = state();
+        let _ = state.update(Event::NewMode);
+        let _ = state.update(Event::Typed("   ".into()));
+        assert_eq!(state.draft_name(), None);
+        let _ = state.update(Event::Typed("DAX".into()));
+        let _ = state.update(Event::Erase { word: false });
+        let _ = state.update(Event::Typed("Y\n".into()));
+        assert_eq!(state.editor.as_ref().unwrap().name, "   DAY");
+        assert_eq!(state.draft_name(), None);
+        let _ = state.update(Event::SaveMode);
+        assert_eq!(state.modes.len(), 2);
+        assert!(state.editor.is_some(), "an unsaveable draft stays open");
+        // A mode keeps its own name.
+        let _ = state.update(Event::CancelEdit);
+        let _ = state.update(Event::EditMode(0));
+        assert_eq!(state.draft_name().as_deref(), Some("day"));
+    }
+
+    #[test]
+    fn deleting_removes_only_the_mode_being_edited() {
+        let mut state = state();
+        let _ = state.update(Event::EditMode(0));
+        let _ = state.update(Event::DeleteMode);
+        assert_eq!(state.modes.len(), 1);
+        assert_eq!(state.modes[0].name, "night");
+        assert!(state.editor.is_none());
+        // Cycling starts over at the first mode left.
+        let _ = state.update(Event::CycleMode);
+        assert_eq!(percents(&state), [20, 15]);
+        // Nothing to delete outside the editor.
+        let _ = state.update(Event::DeleteMode);
+        assert_eq!(state.modes.len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_edited_while_the_file_is_unreadable() {
+        let mut state = state();
+        let _ = state.update(Event::ModesLoaded(Err("bad toml".into())));
+        let _ = state.update(Event::NewMode);
+        let _ = state.update(Event::EditMode(0));
+        assert!(state.editor.is_none());
+        // What was loaded before still applies.
+        let _ = state.update(Event::ApplyMode(1));
+        assert_eq!(percents(&state), [20, 15]);
+    }
+
+    #[test]
+    fn levels_match_at_the_displays_own_resolution() {
+        // Eight steps: 30% is written as 2 and reads back as 29%.
+        let panel = Sink::Backlight {
+            name: "intel_backlight".into(),
+            max: 7,
+        };
+        assert_eq!(panel.raw(30), panel.raw(to_percent(panel.raw(30), 7)));
+        // The floor: 0% on a panel is 1%, not off.
+        assert_eq!(panel.raw(0), panel.raw(1));
+    }
 }

@@ -384,6 +384,41 @@ fn button<'a>(
         .into()
 }
 
+/// A one-line text field, the height of the chips beside it: same text size,
+/// same vertical padding, same corner.
+///
+/// Drawn rather than a `text_input`, because a popup never has the keyboard:
+/// niri keeps keyboard focus on the bar's layer surface while its grabbing
+/// popup is open, so a `text_input` in the popup would show a caret and never
+/// see a key. The module that owns the field reads the keys arriving at the
+/// bar instead (see `brightness::keys`) and passes the text back in here.
+pub fn field<'a>(value: &'a str, placeholder: &'a str, ctx: &Ctx) -> Element<'a, Message> {
+    let text = match value.is_empty() {
+        true => crate::theme::text(placeholder)
+            .size(ctx.small())
+            .class(cosmic::theme::Text::Color(ctx.palette.overlay0)),
+        false => crate::theme::text(value).size(ctx.small()),
+    };
+    let caret = widget::space::horizontal()
+        .width(Length::Fixed(1.5))
+        .height(Length::Fixed(ctx.small()))
+        .apply(widget::container)
+        .class(crate::theme::caret(ctx.palette));
+    // The caret sits at the end, where typing goes; over a placeholder it
+    // leads, the way a real field's does.
+    let row = match value.is_empty() {
+        true => widget::Row::new().push(caret).push(text),
+        false => widget::Row::new().push(text).push(caret),
+    };
+    row.spacing(1.0)
+        .align_y(Alignment::Center)
+        .apply(widget::container)
+        .padding([CHIP_PAD, ROW_GAP])
+        .width(Length::Fill)
+        .class(crate::theme::field(ctx.palette))
+        .into()
+}
+
 /// Padding inside a row that lights up: enough that the highlight has a border
 /// around its text instead of a seam against it, and no more, because the
 /// difference is also how far that row's text sits in from the text of a block

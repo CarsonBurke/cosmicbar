@@ -110,7 +110,7 @@ Placing a module is what starts its subscription; leaving it out costs nothing.
 | `tray` | tray icons with real menus | StatusNotifierItem host |
 | `updates` | pending packages, upgrade in a terminal | `checkupdates` |
 | `battery` | charge and time left, peripherals too | UPower |
-| `brightness` | panel and external monitor sliders | sysfs, `ddcutil` |
+| `brightness` | panel and external monitor sliders, saved modes | sysfs, `ddcutil` |
 | `idle_inhibitor` | stay-awake toggle | logind inhibitor lock |
 | `launcher` | distro badge, quick-launch card | spawns `walker` |
 | `power` | lock, log out, suspend, hibernate, reboot, off | logind, niri IPC |
@@ -136,15 +136,29 @@ The tray hosts its own StatusNotifierWatcher or uses an existing one, including
 KDE's. Watcher unregister signals remove exited apps and withdrawn items
 immediately, without polling; removing the selected item also closes its menu.
 
+Brightness modes (`day`, `night`, …) store a level for each display, so
+monitors can differ. To add one, set the sliders, press + in the brightness
+popup, type a name and press Enter. The pencil applies a mode and opens it for
+editing: rename it, adjust the sliders and save it at the new levels, or delete
+it. Escape cancels. Clicking a mode applies it. Once a mode exists, the cycle
+button, a right-click on the cell and `cosmicbar brightness-mode` each step to
+the next one, and `cosmicbar brightness-mode <name>` applies one by name. A
+display a mode doesn't name keeps its level. Modes are saved to
+`~/.config/cosmicbar/brightness-modes.toml`. That file is not watched: after
+editing it by hand, run `cosmicbar reload`.
+
 ## Popups from a keybind
 
 ```kdl
 Mod+Shift+D { spawn "cosmicbar" "toggle" "date"; }
 Mod+Shift+Escape { spawn "cosmicbar" "close"; }
+Mod+Shift+B { spawn "cosmicbar" "brightness-mode"; }
+Mod+Shift+N { spawn "cosmicbar" "brightness-mode" "night"; }
 ```
 
-`cosmicbar toggle <module>`, `close` and `reload` talk to the running bar over a
-per-display socket, so the same binds work in a nested session.
+`cosmicbar toggle <module>`, `close`, `reload` and `brightness-mode [name]` talk
+to the running bar over a per-display socket, so the same binds work in a nested
+session.
 
 ## Extensions
 

@@ -309,6 +309,30 @@ pub fn chip_danger(palette: Palette) -> cosmic::theme::Button {
     )
 }
 
+/// The insertion point in a [`crate::popup::field`].
+pub fn caret(palette: Palette) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |_theme| container::Style {
+        background: Some(Background::Color(palette.accent())),
+        ..Default::default()
+    })
+}
+
+/// A text field in a popup. It sits on the chip's fill, so a field and the
+/// chips beside it read as one set of controls, and it is ringed in the accent:
+/// a popup field only exists while it is taking keys.
+pub fn field(palette: Palette) -> cosmic::theme::Container<'static> {
+    let base = palette.hover_over(palette.base);
+    cosmic::theme::Container::custom(move |_theme| container::Style {
+        background: Some(Background::Color(base)),
+        border: Border {
+            radius: CHIP_RADIUS.into(),
+            width: 1.0,
+            color: palette.accent(),
+        },
+        ..Default::default()
+    })
+}
+
 fn button(
     text_color: Color,
     background: Option<Color>,

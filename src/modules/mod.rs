@@ -398,32 +398,39 @@ modules! {
     Power => power,
 }
 
-/// Right-click actions. Cross-module policy, so it lives with the registry
-/// rather than in nineteen module files: a right-click does the module's one
-/// obvious verb without opening anything, mirroring the `on-click-right`
-/// bindings of the waybar config this replaces. Anything not listed falls
-/// through to the bar's default, which is to open the module's popup.
-pub fn right_click(id: ModuleId) -> Option<Message> {
-    let event = match id {
-        // Pausing is the verb you want without looking, and the popup's own
-        // controls stay for everything else.
-        ModuleId::Mpris => ModuleEvent::Mpris(mpris::Event::Dispatch(mpris::Action::PlayPause)),
-        // waybar: `volume.sh output mute`.
-        ModuleId::Volume => ModuleEvent::Volume(volume::Event::MuteDefault),
-        // waybar: `nmcli radio wifi off`, made reversible.
-        ModuleId::Network => ModuleEvent::Network(network::Event::ToggleWireless),
-        // waybar: `bluetoothctl power off`, made reversible.
-        ModuleId::Bluetooth => ModuleEvent::Bluetooth(bluetooth::Event::TogglePowered),
-        // waybar: `mako.sh dismiss`.
-        ModuleId::Notifications => ModuleEvent::Notifications(notifications::Event::DismissAll),
-        // waybar: `pkill -RTMIN+1 waybar`, which is how its update module was
-        // told to re-check.
-        ModuleId::Updates => ModuleEvent::Updates(updates::Event::CheckNow),
-        // Holding the machine awake is a switch, not a menu.
-        ModuleId::IdleInhibitor => ModuleEvent::IdleInhibitor(idle_inhibitor::Event::Toggle),
-        _ => return None,
-    };
-    Some(Message::Module(event))
+impl Modules {
+    /// Right-click actions. Cross-module policy, so it lives with the registry
+    /// rather than in nineteen module files: a right-click does the module's one
+    /// obvious verb without opening anything, mirroring the `on-click-right`
+    /// bindings of the waybar config this replaces. Anything not listed falls
+    /// through to the bar's default, which is to open the module's popup.
+    pub fn right_click(&self, id: ModuleId) -> Option<Message> {
+        let event = match id {
+            // Pausing is the verb you want without looking, and the popup's own
+            // controls stay for everything else.
+            ModuleId::Mpris => ModuleEvent::Mpris(mpris::Event::Dispatch(mpris::Action::PlayPause)),
+            // waybar: `volume.sh output mute`.
+            ModuleId::Volume => ModuleEvent::Volume(volume::Event::MuteDefault),
+            // waybar: `nmcli radio wifi off`, made reversible.
+            ModuleId::Network => ModuleEvent::Network(network::Event::ToggleWireless),
+            // waybar: `bluetoothctl power off`, made reversible.
+            ModuleId::Bluetooth => ModuleEvent::Bluetooth(bluetooth::Event::TogglePowered),
+            // waybar: `mako.sh dismiss`.
+            ModuleId::Notifications => ModuleEvent::Notifications(notifications::Event::DismissAll),
+            // waybar: `pkill -RTMIN+1 waybar`, which is how its update module was
+            // told to re-check.
+            ModuleId::Updates => ModuleEvent::Updates(updates::Event::CheckNow),
+            // Holding the machine awake is a switch, not a menu.
+            ModuleId::IdleInhibitor => ModuleEvent::IdleInhibitor(idle_inhibitor::Event::Toggle),
+            // Day to night and back. Until a mode exists there is nothing to step
+            // through, and the popup is where one is made.
+            ModuleId::Brightness if self.brightness.has_modes() => {
+                ModuleEvent::Brightness(brightness::Event::CycleMode)
+            }
+            _ => return None,
+        };
+        Some(Message::Module(event))
+    }
 }
 
 impl<'de> Deserialize<'de> for ModuleId {

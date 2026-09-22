@@ -22,6 +22,8 @@ pub enum Command {
     Close,
     /// Re-read the config file.
     Reload,
+    /// Apply the named brightness mode, or step to the next one.
+    BrightnessMode(Option<String>),
 }
 
 impl Command {
@@ -36,6 +38,11 @@ impl Command {
             }
             Some("close") => Ok(Self::Close),
             Some("reload") => Ok(Self::Reload),
+            Some("brightness-mode") => {
+                // A mode's name may have spaces in it.
+                let name = words.collect::<Vec<_>>().join(" ");
+                Ok(Self::BrightnessMode((!name.is_empty()).then_some(name)))
+            }
             Some(other) => anyhow::bail!("unknown command `{other}`"),
             None => anyhow::bail!("empty command"),
         }

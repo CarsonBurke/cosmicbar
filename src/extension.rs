@@ -24,7 +24,7 @@
 //!
 //! The protocol is a drawing contract, not a widget toolkit: colours are palette
 //! roles rather than hex, so an extension inherits the bar's theme, and the only
-//! interactive element is a labelled button on a popup row.
+//! interactive element is a button on a popup row.
 //! `src/bin/cosmicbar-mlq.rs` holds a working native example.
 
 use std::sync::Arc;
@@ -87,6 +87,8 @@ pub enum Item {
     /// Lines stacked on the left, with an optional button on the right: a job
     /// with a cancel, a device with a connect, a footer with a toggle.
     Row(Row),
+    /// The small label over a group of rows: `running`, `up next`, `recent`.
+    Section(String),
     /// A hairline between sections.
     Divider,
 }
@@ -107,8 +109,24 @@ pub struct Line {
 pub struct Row {
     #[serde(default)]
     pub lines: Vec<Line>,
+    /// A meter under the lines: a run against its time limit, a transfer.
+    #[serde(default)]
+    pub progress: Option<Progress>,
     #[serde(default)]
     pub action: Option<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Progress {
+    /// How full, from 0 to 1; anything outside is clamped.
+    pub value: f32,
+    #[serde(default = "progress_role")]
+    pub color: Role,
+}
+
+fn progress_role() -> Role {
+    Role::Accent
 }
 
 /// A button on a popup row. Pressing it sends `id` back to the extension, which
@@ -117,7 +135,14 @@ pub struct Row {
 #[serde(deny_unknown_fields)]
 pub struct Action {
     pub id: String,
+    /// The button's word. A button with a `glyph` shows the glyph instead: the
+    /// quiet form for a verb repeated down a list, where a column of words is
+    /// the loudest thing in the popup.
+    #[serde(default)]
     pub label: String,
+    /// A nerd-font glyph, drawn in place of the label.
+    #[serde(default)]
+    pub glyph: String,
     /// Paint it as a destructive action: cancel, disconnect, kill.
     #[serde(default)]
     pub danger: bool,
@@ -138,7 +163,7 @@ pub enum Role {
     #[default]
     Fg,
     Muted,
-    /// Faintest readable text: a command line under a job name.
+    /// Faintest readable text: a path or an id under a name.
     Faint,
     Accent,
     Green,
@@ -307,4 +332,57 @@ async fn run(
     // leaving zombies behind between attempts.
     let _ = child.kill().await;
     Ok(alive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grouped_popup_parses() {
+        let frame: Frame = serde_json::from_str(
+            r#"{"cell": null, "popup": [
+                {"section": "running"},
+                {"row": {
+                    "lines": [{"text": "train"}, {"text": "50m of 1h", "color": "green", "small": true}],
+                    "progress": {"value": 0.83, "color": "peach"},
+                    "action": {"id": "cancel:1", "glyph": "󰅖"}
+                }},
+                {"row": {"lines": [{"text": "sweep"}], "action": {"id": "cancel:2", "label": "cancel?", "danger": true}}},
+                "divider"
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.popup[0], Item::Section("running".into()));
+        let Item::Row(row) = &frame.popup[1] else {
+            panic!("{:?}", frame.popup[1]);
+        };
+        assert_eq!(
+            row.progress,
+            Some(Progress {
+                value: 0.83,
+                color: Role::Peach
+            })
+        );
+        let action = row.action.as_ref().unwrap();
+        assert_eq!(
+            (action.label.as_str(), action.glyph.as_str()),
+            ("", "\u{f0156}")
+        );
+    }
+
+    #[test]
+    fn a_progress_defaults_to_the_accent() {
+        let row: Row = serde_json::from_str(r#"{"progress": {"value": 1.5}}"#).unwrap();
+        assert_eq!(row.progress.unwrap().color, Role::Accent);
+    }
+
+    #[test]
+    fn older_frames_still_parse() {
+        let frame: Frame = serde_json::from_str(
+            r#"{"popup": [{"row": {"lines": [{"text": "a"}], "action": {"id": "x", "label": "go"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.popup.len(), 1);
+    }
 }

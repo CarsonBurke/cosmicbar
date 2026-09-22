@@ -41,7 +41,7 @@ use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, ov
 use cosmic::iced::time::Instant;
 use cosmic::iced::widget::scrollable::{Direction, Scrollbar};
 use cosmic::iced::{
-    Alignment, Event as IcedEvent, Length, Padding, Rectangle, Size, Vector, window,
+    Alignment, Color, Event as IcedEvent, Length, Padding, Rectangle, Size, Vector, window,
 };
 use cosmic::widget;
 use cosmic::{Apply, Element, Renderer, Theme};
@@ -416,6 +416,51 @@ pub fn field<'a>(value: &'a str, placeholder: &'a str, ctx: &Ctx) -> Element<'a,
         .padding([CHIP_PAD, ROW_GAP])
         .width(Length::Fill)
         .class(crate::theme::field(ctx.palette))
+        .into()
+}
+
+/// A filled bar: a load, a memory pool, a run against its time limit. Built
+/// from two rounded rectangles because `progress_bar::linear` has no per-value
+/// colour, and a meter's colour is usually what it is saying.
+pub fn meter<'a>(
+    fraction: f32,
+    color: Color,
+    palette: &Palette,
+    height: f32,
+) -> Element<'a, Message> {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let filled = (fraction * 1000.0).round() as u16;
+    let mut row = widget::Row::new().width(Length::Fill);
+    if filled > 0 {
+        row = row.push(segment(color, Length::FillPortion(filled), height));
+    }
+    if filled < 1000 {
+        row = row.push(segment(
+            palette.surface1,
+            Length::FillPortion(1000 - filled),
+            height,
+        ));
+    }
+    row.height(Length::Fixed(height)).into()
+}
+
+fn segment<'a>(color: Color, width: Length, height: f32) -> Element<'a, Message> {
+    widget::space::horizontal()
+        .width(Length::Fill)
+        .height(Length::Fixed(height))
+        .apply(widget::container)
+        .width(width)
+        .height(Length::Fixed(height))
+        .class(cosmic::theme::Container::custom(move |_theme| {
+            widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(color)),
+                border: cosmic::iced::Border {
+                    radius: (height / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
         .into()
 }
 

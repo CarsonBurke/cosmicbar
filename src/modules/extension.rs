@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use cosmic::Element;
 use cosmic::app::Task;
-use cosmic::iced::Subscription;
 use cosmic::iced::futures::{Stream, StreamExt};
-use cosmic::widget;
+use cosmic::iced::{Padding, Subscription};
+use cosmic::{Apply, widget};
 
 use crate::bar::Message;
 use crate::extension::{self, Command, Frame, Item, Line, Row};
@@ -33,6 +33,9 @@ pub enum Event {
 /// Island role: an extension is one flat cell beside its neighbours, the way
 /// the built-in single-cell modules are.
 pub const ISLAND: crate::theme::Island = crate::theme::Island::Flat;
+
+/// A row's meter: the height of the built-in modules' per-item meters.
+const PROGRESS_HEIGHT: f32 = 4.0;
 
 #[derive(Debug)]
 pub struct State {
@@ -146,11 +149,20 @@ impl State {
         }
         if !frame.popup.is_empty() {
             let mut list = crate::popup::column();
-            for item in &frame.popup {
+            for (index, item) in frame.popup.iter().enumerate() {
                 list = list.push(match item {
                     Item::Divider => widget::divider::horizontal::default().into(),
                     Item::Text(line) => self.line(line, ctx, false),
                     Item::Row(row) => self.row(row, ctx, false),
+                    // A group's label sits closer to the rows under it than to
+                    // the group above, or it reads as the last row of that one.
+                    Item::Section(title) => crate::popup::section(title.as_str(), ctx)
+                        .apply(widget::container)
+                        .padding(Padding {
+                            top: if index == 0 { 0.0 } else { crate::popup::GAP },
+                            ..Padding::ZERO
+                        })
+                        .into(),
                 });
             }
             // How long the list is belongs to the extension: the card scrolls
@@ -168,22 +180,39 @@ impl State {
         for (index, line) in row.lines.iter().enumerate() {
             lines = lines.push(self.line(line, ctx, header && index == 0));
         }
+        if let Some(progress) = &row.progress {
+            // Clear of the text above it, the way a built-in meter sits.
+            lines = lines.push(
+                crate::popup::meter(
+                    progress.value,
+                    progress.color.color(&ctx.palette),
+                    &ctx.palette,
+                    PROGRESS_HEIGHT,
+                )
+                .apply(widget::container)
+                .padding(Padding {
+                    top: crate::popup::GAP - crate::popup::LINE_GAP,
+                    ..Padding::ZERO
+                }),
+            );
+        }
         let action = row.action.as_ref().map(|action| {
             let style = match action.danger {
                 true => crate::popup::Chip::Danger,
                 false => crate::popup::Chip::Plain,
             };
-            crate::popup::chip(
-                action.label.as_str(),
-                style,
-                ctx,
-                action.enabled.then(|| {
-                    Message::Module(ModuleEvent::Extension(
-                        self.index,
-                        Event::Press(action.id.clone()),
-                    ))
-                }),
-            )
+            let on_press = action.enabled.then(|| {
+                Message::Module(ModuleEvent::Extension(
+                    self.index,
+                    Event::Press(action.id.clone()),
+                ))
+            });
+            // A button with neither still needs a face to be pressed by.
+            match (action.glyph.as_str(), action.label.as_str()) {
+                ("", "") => crate::popup::chip(action.id.as_str(), style, ctx, on_press),
+                ("", label) => crate::popup::chip(label, style, ctx, on_press),
+                (glyph, _) => crate::popup::icon_chip(glyph, style, ctx, on_press),
+            }
         });
         crate::popup::split(lines, action).into()
     }

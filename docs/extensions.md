@@ -54,11 +54,13 @@ One *frame* per line on stdout. A frame is everything to draw until the next
 one:
 
 ```json
-{"cell": {"glyph": "󰁹", "text": "3 running", "color": "green"},
- "header": {"lines": [{"text": "3 running"}, {"text": "3/4 leases", "color": "muted", "small": true}],
+{"cell": {"glyph": "󰁹", "text": "sweep +2 · 4m", "color": "green"},
+ "header": {"lines": [{"text": "3 running"}, {"text": "3 of 4 slots busy", "color": "muted", "small": true}],
             "action": {"id": "pause", "label": "pause"}},
- "popup": [{"row": {"lines": [{"text": "#12 sweep"}, {"text": "running · 4m", "small": true}],
-                    "action": {"id": "cancel:12", "label": "cancel", "danger": true}}}]}
+ "popup": [{"section": "running"},
+           {"row": {"lines": [{"text": "sweep"}, {"text": "4m of 1h · #12", "color": "muted", "small": true}],
+                    "progress": {"value": 0.07, "color": "green"},
+                    "action": {"id": "cancel:12", "glyph": "󰅖"}}}]}
 ```
 
 | Field | Type | Notes |
@@ -84,16 +86,27 @@ Popup items:
 | Item | Shape |
 |---|---|
 | Text | `{"text": <text>}` |
-| Row | `{"row": {"lines": [<text>, …], "action": <action>&#124;null}}` |
+| Row | `{"row": {"lines": [<text>, …], "progress": <progress>&#124;null, "action": <action>&#124;null}}` |
+| Section | `{"section": "up next"}`: a small label over the rows after it |
 | Divider | `"divider"` |
 
 A `<text>` is `{"text": "…", "color": <role>, "small": false}`; `small` picks the
 secondary text size.
 
-An action is `{"id": …, "label": …, "danger": false, "enabled": true}`. Pressing
-it sends `{"action": "<id>"}`; `enabled: false` keeps a spoken-for button
-visible instead of vanishing (a cancel already requested), and `danger` paints
-it as destructive.
+A `<progress>` is `{"value": 0.5, "color": <role>}`, a thin meter under the
+row's lines: a run against its time limit, a transfer. `value` runs from 0 to 1
+and is clamped; `color` defaults to `accent`.
+
+An action is `{"id": …, "label": …, "glyph": …, "danger": false, "enabled":
+true}`. Pressing it sends `{"action": "<id>"}`; `enabled: false` keeps a
+spoken-for button visible instead of vanishing (a cancel already requested), and
+`danger` paints it as destructive. A `glyph` (a Nerd Font icon) is drawn instead
+of the `label`: use it for a verb repeated down a list, where a column of words
+would be the loudest thing in the popup, and a label for a one-off or a
+question. Send at least one; a button with neither shows its `id`.
+
+Group rows with sections rather than prefixes: `running`, `up next`, `recent`
+say once what each row would otherwise repeat.
 
 Colours are palette roles, never hex, so an extension follows the bar's theme:
 `fg`, `muted`, `faint`, `accent`, `green`, `yellow`, `peach`, `red`.
@@ -121,6 +134,8 @@ cargo install --path . --bin cosmicbar-mlq
 
 Ensure Cargo's installation directory (normally `~/.cargo/bin`) is on the
 bar's `PATH`, or use the installed binary's absolute path in `command`.
+Install it alongside the bar it came with: frames use the protocol items of
+their version, and a bar rejects a frame with items it does not know.
 
 The complete implementation is
 [`src/bin/cosmicbar-mlq.rs`](../src/bin/cosmicbar-mlq.rs). It subscribes to mlqd's
@@ -131,8 +146,24 @@ It looks for `$XDG_RUNTIME_DIR/mlqueue/mlqd.sock`, falling back to
 No queue polling or external interpreter is involved.
 
 The cell shows the longest-running job and its elapsed time; an idle queue
-hides it. The popup has a pinned pause/unpause button and a cancel button for
-each live job. A separate task serializes mutations so a slow response cannot
+hides it. The popup's header counts running and waiting jobs over the slot use
+or the reason nothing starts (paused, admission blocked), beside a pinned
+pause/resume button. Under it, sections list:
+
+- **needs attention**: jobs mlqd wants `mlq recover` for, counted as stuck in
+  the header.
+- **running**: longest first, with elapsed time and, for a job with a time
+  limit, a meter that turns peach at 80%.
+- **up next**: in the order the scheduler will take them, each with what it
+  waits for in words (`next · when a slot frees`, `after <job>`, `held`) rather
+  than mlqd's eligibility code. A held job's button releases it rather than
+  cancelling it; `mlq cancel` still does that.
+- **recent**: the last three jobs finished in the past day, with their outcome
+  (`failed · exit 1 · 13:08`); a failed or lost one can be retried.
+
+Cancel is two presses: the first turns the row's button into `cancel?`, and a
+second within four seconds sends it. Any other press, or closing the popup,
+disarms it. A separate task serializes mutations so a slow response cannot
 hold up popup notifications. Failed mutations appear in the popup until a
 successful mutation or a new snapshot clears the error.
 

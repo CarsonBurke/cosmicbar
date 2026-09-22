@@ -16,7 +16,7 @@ use cosmic::app::Task;
 use cosmic::iced::futures::{SinkExt, Stream};
 use cosmic::iced::{Alignment, Color, Length, Subscription};
 use cosmic::widget;
-use cosmic::{Apply, Element};
+use cosmic::Element;
 
 use crate::bar::Message;
 use crate::modules::{Ctx, ModuleEvent};
@@ -294,7 +294,7 @@ impl State {
                             ],
                         ))
                         .push_maybe(context)
-                        .push(bar(
+                        .push(popup::meter(
                             process.rss_bytes as f32 / largest as f32,
                             palette.mauve,
                             palette,
@@ -370,46 +370,7 @@ fn meter<'a>(fraction: f32, palette: &Palette, height: f32) -> Element<'a, Messa
     } else {
         palette.mauve
     };
-    bar(fraction, color, palette, height)
-}
-
-/// A filled bar built from two rounded rectangles; `progress_bar::linear` has
-/// no per-value colour and the thresholds are the point of the meter.
-fn bar<'a>(fraction: f32, color: Color, palette: &Palette, height: f32) -> Element<'a, Message> {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let filled = (fraction * 1000.0).round() as u16;
-    let mut row = widget::Row::new().width(Length::Fill);
-    if filled > 0 {
-        row = row.push(segment(color, Length::FillPortion(filled), height));
-    }
-    if filled < 1000 {
-        row = row.push(segment(
-            palette.surface1,
-            Length::FillPortion(1000 - filled),
-            height,
-        ));
-    }
-    row.height(Length::Fixed(height)).into()
-}
-
-fn segment<'a>(color: Color, width: Length, height: f32) -> Element<'a, Message> {
-    widget::space::horizontal()
-        .width(Length::Fill)
-        .height(Length::Fixed(height))
-        .apply(widget::container)
-        .width(width)
-        .height(Length::Fixed(height))
-        .class(cosmic::theme::Container::custom(move |_theme| {
-            widget::container::Style {
-                background: Some(cosmic::iced::Background::Color(color)),
-                border: cosmic::iced::Border {
-                    radius: (height / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
+    popup::meter(fraction, color, palette, height)
 }
 
 /// `None` only when `/proc/meminfo` is unreadable, which keeps the last good

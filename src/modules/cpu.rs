@@ -405,47 +405,11 @@ fn meter_color(fraction: f32, palette: &Palette) -> Color {
     }
 }
 
-/// A filled bar built from two rounded rectangles: `progress_bar::linear` has
-/// no per-value colour, and the thresholds are the point of the meter.
+/// The load meter, coloured by the threshold it has crossed: the thresholds
+/// are the point of it.
 fn meter<'a>(fraction: f32, palette: &Palette, height: f32) -> Element<'a, Message> {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let filled = (fraction * 1000.0).round() as u16;
-    let mut row = widget::Row::new().width(Length::Fill);
-    if filled > 0 {
-        row = row.push(segment(
-            meter_color(fraction, palette),
-            Length::FillPortion(filled),
-            height,
-        ));
-    }
-    if filled < 1000 {
-        row = row.push(segment(
-            palette.surface1,
-            Length::FillPortion(1000 - filled),
-            height,
-        ));
-    }
-    row.height(Length::Fixed(height)).into()
-}
-
-fn segment<'a>(color: Color, width: Length, height: f32) -> Element<'a, Message> {
-    widget::space::horizontal()
-        .width(Length::Fill)
-        .height(Length::Fixed(height))
-        .apply(widget::container)
-        .width(width)
-        .height(Length::Fixed(height))
-        .class(cosmic::theme::Container::custom(move |_theme| {
-            widget::container::Style {
-                background: Some(cosmic::iced::Background::Color(color)),
-                border: cosmic::iced::Border {
-                    radius: (height / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
+    let color = meter_color(fraction.clamp(0.0, 1.0), palette);
+    popup::meter(fraction, color, palette, height)
 }
 
 /// 24 threads in two columns: one row per thread would be taller than the

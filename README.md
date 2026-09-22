@@ -175,9 +175,10 @@ command = ["cosmicbar-mlq"]
 ```
 
 `cosmicbar-mlq` is a bundled native Rust extension: it subscribes to a local ML
-job queue and gives the bar a cell plus a popup with per-job cancel buttons -
+job queue and gives the bar a cell plus a popup that groups running, queued and recent jobs -
 the second screenshot above. Install it with
-`cargo install --path . --bin cosmicbar-mlq` and ensure Cargo's bin directory is
+`cargo install --path . --bin cosmicbar-mlq` (together with the bar, whose
+frame protocol it tracks) and ensure Cargo's bin directory is
 on the bar's `PATH`, or configure the installed binary's absolute path. Source:
 [`src/bin/cosmicbar-mlq.rs`](src/bin/cosmicbar-mlq.rs). Protocol:
 [docs/extensions.md](docs/extensions.md).

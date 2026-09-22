@@ -58,7 +58,7 @@ one:
  "header": {"lines": [{"text": "3 running"}, {"text": "3 of 4 slots busy", "color": "muted", "small": true}],
             "action": {"id": "pause", "label": "pause"}},
  "popup": [{"section": "running"},
-           {"row": {"lines": [{"text": "sweep"}, {"text": "4m of 1h · #12", "color": "green", "small": true}],
+           {"row": {"lines": [{"text": "sweep"}, {"text": "4m of 1h · #12", "color": "muted", "small": true}],
                     "progress": {"value": 0.07, "color": "green"},
                     "action": {"id": "cancel:12", "glyph": "󰅖"}}}]}
 ```

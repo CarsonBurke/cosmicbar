@@ -265,7 +265,6 @@ enum Standing {
 /// Jobs are named rather than numbered: the other job is in the same list.
 struct Wait {
     text: String,
-    color: &'static str,
     standing: Standing,
 }
 
@@ -290,24 +289,20 @@ fn wait(job: &Value, names: &HashMap<i64, &str>) -> Wait {
         .first()
         .map(named)
         .unwrap_or_else(|| "another job".into());
-    let (text, color, standing) = match code {
-        "protected_drain" => ("next · when a slot frees".into(), "fg", Standing::Next),
-        "supersedes_lower_priority" => (format!("next · ahead of {other}"), "fg", Standing::Next),
+    let (text, standing) = match code {
+        "protected_drain" => ("next · when a slot frees".into(), Standing::Next),
+        "supersedes_lower_priority" => (format!("next · ahead of {other}"), Standing::Next),
         // Behind the job above it in the list, which says so itself: naming
         // it again on every row under it is the whole list repeating one fact.
-        "waiting_for_slot" | "waiting_for_higher_priority" => {
-            ("queued".into(), "muted", Standing::Ready)
+        "waiting_for_slot" | "waiting_for_higher_priority" => ("queued".into(), Standing::Ready),
+        "backfill_window_open" | "backfill_eligible" => {
+            (format!("may fit in before {other}"), Standing::Ready)
         }
-        "backfill_window_open" | "backfill_eligible" => (
-            format!("may fit in before {other}"),
-            "muted",
-            Standing::Ready,
-        ),
-        "waiting_for_retry_delay" => ("retrying shortly".into(), "muted", Standing::Ready),
-        "paused" => ("paused".into(), "peach", Standing::Ready),
-        "admission_blocked" => ("admission blocked".into(), "peach", Standing::Ready),
+        "waiting_for_retry_delay" => ("retrying shortly".into(), Standing::Ready),
+        "paused" => ("paused".into(), Standing::Ready),
+        "admission_blocked" => ("admission blocked".into(), Standing::Ready),
         "behind_backfill_cutoff" | "backfill_bypass_consumed" => {
-            (format!("after {other}"), "muted", Standing::After)
+            (format!("after {other}"), Standing::After)
         }
         "waiting_for_dependencies" => {
             let text = match ids.as_slice() {
@@ -315,17 +310,13 @@ fn wait(job: &Value, names: &HashMap<i64, &str>) -> Wait {
                 [one] => format!("after {}", named(one)),
                 [one, rest @ ..] => format!("after {} +{}", named(one), rest.len()),
             };
-            (text, "muted", Standing::After)
+            (text, Standing::After)
         }
-        "held" => ("held".into(), "muted", Standing::Held),
+        "held" => ("held".into(), Standing::Held),
         // A code this build does not know yet is still better read than hidden.
-        other => (other.replace('_', " "), "muted", Standing::Ready),
+        other => (other.replace('_', " "), Standing::Ready),
     };
-    Wait {
-        text,
-        color,
-        standing,
-    }
+    Wait { text, standing }
 }
 
 /// A finished job's `stateReason`, shortened to what the state does not say.
@@ -351,18 +342,13 @@ fn outcome(reason: &str) -> Option<String> {
     }
 }
 
-/// A popup row in the extension protocol's shape.
-fn row(
-    title: String,
-    detail: String,
-    color: &str,
-    progress: Option<Value>,
-    action: Option<Value>,
-) -> Value {
+/// A popup row in the extension protocol's shape. The detail line stays muted
+/// whatever it says, so the names are what the eye runs down.
+fn row(title: String, detail: String, progress: Option<Value>, action: Option<Value>) -> Value {
     let mut row = json!({
         "lines": [
             {"text": title},
-            {"text": detail, "color": color, "small": true},
+            {"text": detail, "color": "muted", "small": true},
         ],
     });
     if let Some(progress) = progress {
@@ -546,10 +532,9 @@ impl Extension {
             (_, None) => duration(elapsed),
         };
         if priority(job) != 0 {
-            detail.push_str(&format!(" · pri {}", priority(job)));
+            detail.push_str(&format!(" · priority {}", priority(job)));
         }
-        let cancelling = job["cancelRequested"].as_bool().unwrap_or(false);
-        if cancelling {
+        if job["cancelRequested"].as_bool().unwrap_or(false) {
             detail.push_str(" · cancelling");
         }
         detail.push_str(&format!(" · #{}", job_id(job)));
@@ -563,7 +548,6 @@ impl Extension {
         row(
             elide(name(job), ROW_NAME_LIMIT),
             detail,
-            if cancelling { "peach" } else { "green" },
             progress,
             Some(self.cancel(job)),
         )
@@ -572,7 +556,7 @@ impl Extension {
     fn waiting_row(&self, job: &Value, wait: &Wait) -> Value {
         let mut detail = wait.text.clone();
         if priority(job) != 0 {
-            detail.push_str(&format!(" · pri {}", priority(job)));
+            detail.push_str(&format!(" · priority {}", priority(job)));
         }
         if job["cancelRequested"].as_bool().unwrap_or(false) {
             detail.push_str(" · cancelling");
@@ -584,22 +568,14 @@ impl Extension {
             }
             _ => self.cancel(job),
         };
-        row(
-            elide(name(job), ROW_NAME_LIMIT),
-            detail,
-            wait.color,
-            None,
-            Some(action),
-        )
+        row(elide(name(job), ROW_NAME_LIMIT), detail, None, Some(action))
     }
 
     fn recent_row(job: &Value, now: i64) -> Value {
         let state = job["state"].as_str().unwrap_or("?");
-        let (word, color) = match state {
-            "succeeded" => ("done", "green"),
-            "failed" => ("failed", "red"),
-            "lost" => ("lost", "red"),
-            other => (other, "muted"),
+        let word = match state {
+            "succeeded" => "done",
+            other => other,
         };
         let mut detail = vec![word.to_owned()];
         detail.extend(job["stateReason"].as_str().and_then(outcome));
@@ -610,7 +586,6 @@ impl Extension {
         row(
             elide(name(job), ROW_NAME_LIMIT),
             detail.join(" · "),
-            color,
             None,
             retry,
         )
@@ -666,7 +641,6 @@ impl Extension {
                 popup.push(row(
                     elide(name(job), ROW_NAME_LIMIT),
                     format!("run mlq recover · #{}", job_id(job)),
-                    "red",
                     None,
                     Some(self.cancel(job)),
                 ));

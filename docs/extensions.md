@@ -151,18 +151,21 @@ It looks for `$XDG_RUNTIME_DIR/mlqueue/mlqd.sock`, falling back to
 No queue polling or external interpreter is involved.
 
 The cell shows the longest-running job and its elapsed time; an idle queue
-hides it. The popup's header counts running and waiting jobs over the slot use
+hides it. The popup's header counts running, queued and held jobs over the slot use
 or the reason nothing starts (paused, admission blocked), beside a pinned
 pause/resume button. Under it, sections list:
 
-- **needs attention**: jobs mlqd wants `mlq recover` for, counted as stuck in
-  the header.
+- **lost contact**: runs mlqd can no longer supervise (its `needs_attention`
+  state). The command may still be alive and its slot stays taken until
+  `mlq recover` settles it; the header counts these first.
 - **running**: longest first, with elapsed time and, for a job with a time
   limit, a meter that turns peach at 80%.
 - **up next**: in the order the scheduler will take them, each with what it
-  waits for in words (`next · when a slot frees`, `after <job>`, `held`) rather
-  than mlqd's eligibility code. A held job's button releases it rather than
-  cancelling it; `mlq cancel` still does that.
+  waits for in words (`next · when a slot frees`, `after <job>`) rather than
+  mlqd's eligibility code.
+- **held**: jobs that start only once released, kept apart from the ones that
+  are coming. A held job's button releases it rather than cancelling it;
+  `mlq cancel` still does that.
 - **recent**: the last three jobs finished in the past day, with their outcome
   (`failed · exit 1 · 13:08`); a failed or lost one can be retried.
 

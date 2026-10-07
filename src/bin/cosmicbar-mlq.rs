@@ -32,6 +32,9 @@ const NAME_LIMIT: usize = 26;
 /// A job's name in the popup. Longer than the cell's: the popup has the room,
 /// and two sweeps differing only in their last token are why the name exists.
 const ROW_NAME_LIMIT: usize = 44;
+/// Another job's name inside a detail line (`after sweep-lr1e4`), which also
+/// has to fit the job's own priority and id on one line.
+const REF_NAME_LIMIT: usize = 28;
 const REASON_LIMIT: usize = 48;
 const MIN_TICK_MS: i64 = 50;
 /// How long a cancel stays armed for the press that confirms it.
@@ -283,7 +286,7 @@ fn wait(job: &Value, names: &HashMap<i64, &str>) -> Wait {
     let named = |id: &i64| {
         names
             .get(id)
-            .map_or_else(|| format!("#{id}"), |name| elide(name, ROW_NAME_LIMIT))
+            .map_or_else(|| format!("#{id}"), |name| elide(name, REF_NAME_LIMIT))
     };
     let other = ids
         .first()
@@ -479,18 +482,22 @@ impl Extension {
     }
 
     /// What the queue is doing, and the verb for all of it.
-    fn header(&self, status: &Value, stuck: usize, running: usize, waiting: usize) -> Value {
+    ///
+    /// Held jobs are counted apart from queued ones: a held job starts only
+    /// when someone releases it, so it is not part of what is coming.
+    fn header(&self, status: &Value, [lost, running, queued, held]: [usize; 4]) -> Value {
         let paused = status["paused"].as_bool().unwrap_or(false);
-        let mut title = Vec::new();
-        if stuck > 0 {
-            title.push(format!("{stuck} stuck"));
-        }
-        if running > 0 {
-            title.push(format!("{running} running"));
-        }
-        if waiting > 0 {
-            title.push(format!("{waiting} waiting"));
-        }
+        let title: Vec<String> = [
+            // Short enough that all four counts still fit the title's one line.
+            (lost, "lost"),
+            (running, "running"),
+            (queued, "queued"),
+            (held, "held"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, word)| format!("{count} {word}"))
+        .collect();
         let title = match title.is_empty() {
             true => "queue empty".to_owned(),
             false => title.join(" · "),
@@ -554,21 +561,32 @@ impl Extension {
     }
 
     fn waiting_row(&self, job: &Value, wait: &Wait) -> Value {
-        let mut detail = wait.text.clone();
-        if priority(job) != 0 {
-            detail.push_str(&format!(" · priority {}", priority(job)));
-        }
+        let mut detail = Vec::new();
         if job["cancelRequested"].as_bool().unwrap_or(false) {
-            detail.push_str(" · cancelling");
+            // What it was waiting for stopped mattering when it was cancelled.
+            detail.push("cancelling".to_owned());
+        } else {
+            // Under the `held` label the word would repeat on every row.
+            if wait.standing != Standing::Held {
+                detail.push(wait.text.clone());
+            }
+            if priority(job) != 0 {
+                detail.push(format!("priority {}", priority(job)));
+            }
         }
-        detail.push_str(&format!(" · #{}", job_id(job)));
+        detail.push(format!("#{}", job_id(job)));
         let action = match wait.standing {
             Standing::Held => {
                 json!({"id": format!("release:{}", job_id(job)), "glyph": ICON_RELEASE})
             }
             _ => self.cancel(job),
         };
-        row(elide(name(job), ROW_NAME_LIMIT), detail, None, Some(action))
+        row(
+            elide(name(job), ROW_NAME_LIMIT),
+            detail.join(" · "),
+            None,
+            Some(action),
+        )
     }
 
     fn recent_row(job: &Value, now: i64) -> Value {
@@ -620,7 +638,8 @@ impl Extension {
         active.sort_by_key(|job| std::cmp::Reverse(self.elapsed_ms(job, now)));
         // The order the scheduler will take them in, as far as the snapshot
         // says: the job it is draining for, then by priority and readiness,
-        // then what waits on others, then what is held.
+        // then what waits on others. Held jobs sort last and get a section
+        // of their own: nothing but a release will start them.
         waiting.sort_by_key(|(wait, job)| {
             (
                 wait.standing,
@@ -629,6 +648,8 @@ impl Extension {
                 job_id(job),
             )
         });
+        let queued = waiting.partition_point(|(wait, _)| wait.standing != Standing::Held);
+        let (upcoming, held) = waiting.split_at(queued);
         finished.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
 
         let mut popup = Vec::new();
@@ -636,27 +657,32 @@ impl Extension {
             popup.push(json!({"text": {"text": error, "color": "red", "small": true}}));
         }
         if !attention.is_empty() {
-            popup.push(json!({"section": "needs attention"}));
+            // mlqd calls this `needs_attention`, which says neither what went
+            // wrong nor what to do: it lost the run's supervisor, cannot tell
+            // whether the command is still alive, and keeps its slot taken
+            // until `mlq recover` settles it.
+            popup.push(json!({"section": "lost contact"}));
             for job in &attention {
-                popup.push(row(
+                let mut item = row(
                     elide(name(job), ROW_NAME_LIMIT),
-                    format!("run mlq recover · #{}", job_id(job)),
+                    format!("may still be running · mlq recover · #{}", job_id(job)),
                     None,
                     Some(self.cancel(job)),
-                ));
+                );
+                // The one detail line that is a problem rather than a status.
+                item["row"]["lines"][1]["color"] = json!("peach");
+                popup.push(item);
             }
         }
         if !active.is_empty() {
             popup.push(json!({"section": "running"}));
             popup.extend(active.iter().map(|job| self.running_row(job, now)));
         }
-        if !waiting.is_empty() {
-            popup.push(json!({"section": "up next"}));
-            popup.extend(
-                waiting
-                    .iter()
-                    .map(|(wait, job)| self.waiting_row(job, wait)),
-            );
+        for (label, group) in [("up next", upcoming), ("held", held)] {
+            if !group.is_empty() {
+                popup.push(json!({"section": label}));
+                popup.extend(group.iter().map(|(wait, job)| self.waiting_row(job, wait)));
+            }
         }
         if !finished.is_empty() {
             popup.push(json!({"section": "recent"}));
@@ -670,7 +696,10 @@ impl Extension {
 
         json!({
             "cell": self.cell(status, now),
-            "header": self.header(status, attention.len(), active.len(), waiting.len()),
+            "header": self.header(
+                status,
+                [attention.len(), active.len(), upcoming.len(), held.len()],
+            ),
             "popup": popup,
         })
     }
@@ -1048,11 +1077,11 @@ mod tests {
             "jobs": [
                 {"id": 1, "name": "done", "state": "succeeded", "finishedAt": now - 1000},
                 {"id": 2, "name": "ancient", "state": "failed", "finishedAt": now - RECENT_WINDOW_MS - 1},
-                {"id": 3, "name": "held", "state": "held", "eligibility": "held"},
+                {"id": 3, "name": "parked", "state": "held", "eligibility": "held", "priority": 2},
                 {"id": 4, "name": "low", "state": "queued", "eligibility": "waiting_for_slot", "readySequence": 1},
                 {"id": 5, "name": "high", "state": "queued", "priority": 5, "eligibility": "waiting_for_slot", "readySequence": 2},
                 {"id": 6, "name": "train", "state": "running", "updatedAt": now - 60_000},
-                {"id": 7, "name": "stuck", "state": "needs_attention"},
+                {"id": 7, "name": "orphan", "state": "needs_attention"},
             ],
         });
         let mut extension = Extension {
@@ -1076,23 +1105,36 @@ mod tests {
         assert_eq!(
             order,
             [
-                "needs attention",
-                "stuck",
+                "lost contact",
+                "orphan",
                 "running",
                 "train",
                 "up next",
                 "high",
                 "low",
                 "held",
+                "parked",
                 "recent",
                 "done",
             ]
         );
         assert_eq!(
             frame["header"]["lines"][0]["text"],
-            "1 stuck · 1 running · 3 waiting"
+            "1 lost · 1 running · 2 queued · 1 held"
         );
+        let parked = &frame["popup"][8]["row"];
+        assert_eq!(parked["lines"][1]["text"], "priority 2 · #3");
+        assert_eq!(parked["action"]["id"], "release:3");
         assert_eq!(frame["header"]["lines"][1]["text"], "1 of 2 slots busy");
+    }
+
+    #[test]
+    fn a_cancelled_wait_says_only_that() {
+        let job = json!({"id": 4, "name": "low", "state": "queued", "priority": 3, "cancelRequested": true});
+        let wait = waiting_for("backfill_window_open: job 9190");
+        let row = Extension::default().waiting_row(&job, &wait);
+        assert_eq!(row["row"]["lines"][1]["text"], "cancelling · #4");
+        assert_eq!(row["row"]["action"]["enabled"], false);
     }
 
     #[test]

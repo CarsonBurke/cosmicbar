@@ -152,7 +152,7 @@ impl Role {
         match self {
             Role::Fg => palette.fg(),
             Role::Muted => palette.muted(),
-            Role::Faint => palette.overlay0,
+            Role::Faint => palette.faint(),
             Role::Accent => palette.accent(),
             Role::Green => palette.green,
             Role::Yellow => palette.yellow,

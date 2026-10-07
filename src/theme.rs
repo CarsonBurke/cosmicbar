@@ -144,6 +144,25 @@ impl Palette {
         self.subtext0
     }
 
+    /// Secondary popup text must remain readable at the small type scale.
+    /// Decorative overlays and disabled controls keep their original role;
+    /// labels choose the quietest text role with at least 4.5:1 contrast.
+    pub fn faint(&self) -> Color {
+        for color in [self.overlay0, self.subtext0, self.text] {
+            let color = Color { a: 1.0, ..color };
+            if contrast(color, self.base) >= 4.5 {
+                return color;
+            }
+        }
+        // A custom desktop palette may make all its text roles unreadable.
+        // Black or white always provides the required contrast on a solid base.
+        if luminance(self.base) > 0.179 {
+            Color::BLACK
+        } else {
+            Color::WHITE
+        }
+    }
+
     /// Hover and press fills, as a lift away from whatever the cell is sitting
     /// on. waybar's CSS named one flat `@hover-bg` (`surface1`) for every
     /// module; on a 24px strip that reads as a grey slab on the dark islands
@@ -168,6 +187,23 @@ impl Palette {
             a: 1.0,
         }
     }
+}
+
+fn luminance(color: Color) -> f32 {
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+}
+
+fn contrast(a: Color, b: Color) -> f32 {
+    let a = luminance(a);
+    let b = luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// Where one island ends and the next begins. waybar coloured its modules from a
@@ -416,27 +452,29 @@ pub fn icon_font(bold: bool) -> Font {
     }
 }
 
-/// The system text font, set once at startup with the bar's configured weight.
-static SYSTEM_FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+/// Fonts follow both startup configuration and live configuration reloads.
+static SYSTEM_FONT: std::sync::LazyLock<std::sync::RwLock<Font>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(font(true)));
 
 pub fn set_font(font: Font) {
-    let _ = SYSTEM_FONT.set(font);
+    *SYSTEM_FONT.write().expect("system font lock poisoned") = font;
 }
 
 fn bar_font() -> Font {
-    *SYSTEM_FONT.get_or_init(|| font(true))
+    *SYSTEM_FONT.read().expect("system font lock poisoned")
 }
 
-/// The icon font, set once at startup so icon-only widgets use the configured
+/// The icon font, updated so icon-only widgets use the configured
 /// weight without changing the system font used by normal text.
-static ICON_FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+static ICON_FONT: std::sync::LazyLock<std::sync::RwLock<Font>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(icon_font(true)));
 
 pub fn set_icon_font(font: Font) {
-    let _ = ICON_FONT.set(font);
+    *ICON_FONT.write().expect("icon font lock poisoned") = font;
 }
 
 fn bar_icon_font() -> Font {
-    *ICON_FONT.get_or_init(|| icon_font(true))
+    *ICON_FONT.read().expect("icon font lock poisoned")
 }
 
 /// Text in the system interface font.
@@ -565,4 +603,35 @@ pub fn glyph_only<'a>(
             size * GLYPH_ONLY_SCALE,
         )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faint_text_has_readable_contrast_in_both_builtin_palettes() {
+        assert!((contrast(Palette::MOCHA.overlay0, Palette::MOCHA.base) - 3.358).abs() < 0.001);
+        assert!((contrast(Palette::LATTE.overlay0, Palette::LATTE.base) - 2.302).abs() < 0.001);
+        for palette in [Palette::MOCHA, Palette::LATTE, Palette::system()] {
+            assert!(contrast(palette.faint(), palette.base) >= 4.5);
+        }
+        assert_eq!(Palette::MOCHA.faint(), Palette::MOCHA.subtext0);
+        assert_eq!(Palette::LATTE.faint(), Palette::LATTE.text);
+    }
+
+    #[test]
+    fn unreadable_custom_text_roles_fall_back_across_light_and_dark_bases() {
+        for channel in 0..=255 {
+            let base = c(channel, channel, channel);
+            let palette = Palette {
+                base,
+                overlay0: base,
+                subtext0: base,
+                text: base,
+                ..Palette::MOCHA
+            };
+            assert!(contrast(palette.faint(), base) >= 4.5);
+        }
+    }
 }

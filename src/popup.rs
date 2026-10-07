@@ -286,7 +286,7 @@ pub fn title<'a>(text: impl Into<Cow<'a, str>> + 'a, ctx: &Ctx) -> Text<'a> {
 pub fn section<'a>(text: impl Into<Cow<'a, str>> + 'a, ctx: &Ctx) -> Text<'a> {
     crate::theme::text(text)
         .size(ctx.small())
-        .class(cosmic::theme::Text::Color(ctx.palette.overlay0))
+        .class(cosmic::theme::Text::Color(ctx.palette.faint()))
 }
 
 /// A row's own text: the name of the thing the row is about.
@@ -396,7 +396,7 @@ pub fn field<'a>(value: &'a str, placeholder: &'a str, ctx: &Ctx) -> Element<'a,
     let text = match value.is_empty() {
         true => crate::theme::text(placeholder)
             .size(ctx.small())
-            .class(cosmic::theme::Text::Color(ctx.palette.overlay0)),
+            .class(cosmic::theme::Text::Color(ctx.palette.faint())),
         false => crate::theme::text(value).size(ctx.small()),
     };
     let caret = widget::space::horizontal()

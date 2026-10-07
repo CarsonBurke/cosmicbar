@@ -33,7 +33,9 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 libpulse-binding = "2.30"
 # `data` (default) gives the item/menu model over zbus; the gtk feature would
 # drag GTK3 in for its menu widget, which we render ourselves.
-system-tray = "0.8"
+# 0.8.9 keeps watching registrations after an item's discovery fails and
+# retries reads when an application registers before exporting its object.
+system-tray = "0.8.9"
 # Tray items and app windows name their icons the freedesktop way; this is the
 # resolver libcosmic itself uses, so a bar icon and a COSMIC icon agree.
 freedesktop-icons = { git = "https://github.com/pop-os/freedesktop-icons", package = "cosmic-freedesktop-icons", version = "0.4.0" }

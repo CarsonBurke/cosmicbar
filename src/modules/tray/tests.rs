@@ -325,3 +325,161 @@ async fn builtin_watcher_removes_disconnected_items() {
     .await;
     task.abort();
 }
+
+#[tokio::test]
+async fn failed_discovery_does_not_stop_later_registrations() {
+    if !private_bus_child("failed_discovery_does_not_stop_later_registrations") {
+        return;
+    }
+    let watcher = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.kde.StatusNotifierWatcher")
+        .unwrap()
+        .serve_at("/StatusNotifierWatcher", Registry::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let control = zbus::Proxy::new(
+        &watcher,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.kde.StatusNotifierWatcher",
+    )
+    .await
+    .unwrap();
+    // Pre-register a sentinel so its Add can only come from the initial
+    // snapshot. Wait for it before testing the live registration listener.
+    let sentinel = zbus::connection::Builder::session()
+        .unwrap()
+        .serve_at(ITEM_OBJECT, TrayApp)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let sentinel_address = sentinel.unique_name().unwrap().as_str();
+    let sentinel_entry = format!("{sentinel_address}{ITEM_OBJECT}");
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&sentinel_entry,))
+        .await
+        .unwrap();
+    let (mut sender, mut events) = cosmic::iced::futures::channel::mpsc::channel(32);
+    let task = tokio::spawn(async move { session(&mut sender).await.unwrap() });
+    next_matching(&mut events, |event| matches!(event, Event::Connected(_))).await;
+
+    next_matching(
+        &mut events,
+        |event| matches!(event, Event::Added(found, _) if &**found == sentinel_address),
+    )
+    .await;
+
+    // An application can register before exporting its object. A failed
+    // GetAll must not terminate the listener for every later application.
+    let missing_app = zbus::connection::Builder::session()
+        .unwrap()
+        .serve_at(ITEM_OBJECT, TrayApp)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let missing = format!("{}/NotExported", missing_app.unique_name().unwrap());
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&missing,))
+        .await
+        .unwrap();
+    let app = zbus::connection::Builder::session()
+        .unwrap()
+        .serve_at(ITEM_OBJECT, TrayApp)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let address = app.unique_name().unwrap().as_str();
+    let healthy = format!("{address}{ITEM_OBJECT}");
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&healthy,))
+        .await
+        .unwrap();
+    let added = next_matching(
+        &mut events,
+        |event| matches!(event, Event::Added(found, _) if &**found == address),
+    )
+    .await;
+    let mut state = State::default();
+    drop(state.update(added));
+    assert_eq!(state.item(address).unwrap().id, "tray-lifecycle-test");
+    task.abort();
+}
+
+#[tokio::test]
+async fn transient_discovery_failure_is_retried() {
+    if !private_bus_child("transient_discovery_failure_is_retried") {
+        return;
+    }
+    let watcher = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.kde.StatusNotifierWatcher")
+        .unwrap()
+        .serve_at("/StatusNotifierWatcher", Registry::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let control = zbus::Proxy::new(
+        &watcher,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.kde.StatusNotifierWatcher",
+    )
+    .await
+    .unwrap();
+    let app = zbus::Connection::session().await.unwrap();
+    let mut requests = zbus::MessageStream::from(&app);
+    let late_app = app.clone();
+    let export = tokio::spawn(async move {
+        while let Some(request) = requests.next().await {
+            let request = request.unwrap();
+            let header = request.header();
+            if header.message_type() == zbus::message::Type::MethodCall
+                && header.path().map(|path| path.as_str()) == Some(ITEM_OBJECT)
+                && header.member().map(|member| member.as_str()) == Some("GetAll")
+            {
+                // Handle the first read ourselves, then export the object
+                // before replying. The retry must succeed without another
+                // registration or a timing-dependent sleep in the test.
+                late_app.object_server().at(ITEM_OBJECT, TrayApp).await.unwrap();
+                late_app
+                    .reply_error(
+                        &header,
+                        "org.freedesktop.DBus.Error.UnknownObject",
+                        &"item is not ready",
+                    )
+                    .await
+                    .unwrap();
+                return;
+            }
+        }
+        panic!("tray discovery never requested properties");
+    });
+    let address = app.unique_name().unwrap().as_str();
+    let entry = format!("{address}{ITEM_OBJECT}");
+    // Pre-register so discovery comes from the initial snapshot, with no
+    // second registration that could hide a failure to retry GetAll.
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&entry,))
+        .await
+        .unwrap();
+    let (mut sender, mut events) = cosmic::iced::futures::channel::mpsc::channel(32);
+    let task = tokio::spawn(async move { session(&mut sender).await.unwrap() });
+    next_matching(&mut events, |event| matches!(event, Event::Connected(_))).await;
+    let added = next_matching(
+        &mut events,
+        |event| matches!(event, Event::Added(found, _) if &**found == address),
+    )
+    .await;
+    let mut state = State::default();
+    drop(state.update(added));
+    assert_eq!(state.item(address).unwrap().id, "tray-lifecycle-test");
+    export.await.unwrap();
+    task.abort();
+}

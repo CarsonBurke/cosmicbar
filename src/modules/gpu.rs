@@ -83,6 +83,7 @@ const LABEL_WIDTH: f32 = 76.0;
 #[derive(Debug, Clone)]
 pub enum Event {
     Sample(Arc<Sample>),
+    Unavailable,
 }
 
 /// What the bar needs every tick. Every field here comes from a call that a
@@ -158,6 +159,13 @@ fn stream(open: &bool) -> impl Stream<Item = Message> + use<> {
                 Ok(Err(error)) => log::debug!("nvml unavailable: {error}"),
                 // The blocking pool is gone; so is the app.
                 Err(_) => return,
+            }
+            if sender
+                .send(event_message(Event::Unavailable))
+                .await
+                .is_err()
+            {
+                return;
             }
             if started.elapsed() >= STABLE_SESSION {
                 attempt = 0;
@@ -316,7 +324,7 @@ fn read_processes(device: &nvml_wrapper::Device<'_>) -> Vec<GpuProcess> {
         });
     }
 
-    processes.sort_unstable_by(|a, b| b.vram_bytes.cmp(&a.vram_bytes));
+    processes.sort_unstable_by_key(|process| std::cmp::Reverse(process.vram_bytes));
     // A busy desktop can hold a dozen contexts; the popup shows the ones that
     // matter and stays inside its height budget.
     processes.truncate(MAX_PROCESSES);
@@ -333,6 +341,7 @@ impl State {
     pub fn update(&mut self, event: Event) -> Task<Message> {
         match event {
             Event::Sample(sample) => self.sample = Some(sample),
+            Event::Unavailable => self.sample = None,
         }
         Task::none()
     }
@@ -630,4 +639,28 @@ fn segment<'a>(color: Color, width: Length, height: f32) -> Element<'a, Message>
             }
         }))
         .into()
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn losing_the_gpu_clears_previously_successful_telemetry() {
+        let mut state = State::default();
+        let _ = state.update(Event::Sample(Arc::new(Sample {
+            device: DeviceInfo {
+                name: "GPU".into(),
+                slowdown_c: None,
+            },
+            temp_c: 70,
+            gpu_percent: 90,
+            vram_used: 1,
+            vram_total: 2,
+            detail: None,
+        })));
+        assert!(state.sample.is_some());
+        let _ = state.update(Event::Unavailable);
+        assert!(state.sample.is_none());
+    }
 }

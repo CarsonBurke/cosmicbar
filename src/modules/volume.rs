@@ -65,6 +65,7 @@ const MAX_PCT: u32 = 100;
 /// back to telling the truth. Guards against a device that clamps or ignores
 /// the value we asked for.
 const TARGET_PATIENCE: u8 = 6;
+const TARGET_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Reconnect ladder for a daemon that is down or restarting, as in `mlqd.rs`.
 const RECONNECT_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
@@ -185,6 +186,8 @@ pub enum Event {
     /// A command reached the pulse thread; the daemon's own event carries the
     /// resulting state, so there is nothing to apply here.
     Sent,
+    Expire(Kind, u32, Instant),
+    Rejected(Kind, u32, Instant),
     /// A command could not be handed over at all.
     Failed(String),
 }
@@ -201,7 +204,7 @@ pub struct State {
     /// snapshots it may still wait for. Scrolling three notches inside one
     /// frame has to add 15%, not 5% three times, so the next step is computed
     /// from the target rather than from the last snapshot.
-    targets: HashMap<(Kind, u32), (u32, u8)>,
+    targets: HashMap<(Kind, u32), (u32, u8, Instant)>,
     /// Fractional wheel travel not yet worth a step.
     wheel: f32,
     error: Option<String>,
@@ -269,26 +272,34 @@ impl State {
                 if wanted == current {
                     return Task::none();
                 }
-                self.aim(Kind::Sink, index, wanted);
-                send(Command::Volume {
-                    kind: Kind::Sink,
-                    index,
-                    channels,
-                    pct: wanted,
-                })
+                let (expiry, deadline) = self.aim(Kind::Sink, index, wanted);
+                Task::batch([
+                    expiry,
+                    send(Command::Volume {
+                        kind: Kind::Sink,
+                        index,
+                        channels,
+                        pct: wanted,
+                        deadline,
+                    }),
+                ])
             }
             Event::SetVolume(kind, index, pct) => {
                 let pct = pct.min(MAX_PCT);
                 let Some(channels) = self.channels(kind, index) else {
                     return Task::none();
                 };
-                self.aim(kind, index, pct);
-                send(Command::Volume {
-                    kind,
-                    index,
-                    channels,
-                    pct,
-                })
+                let (expiry, deadline) = self.aim(kind, index, pct);
+                Task::batch([
+                    expiry,
+                    send(Command::Volume {
+                        kind,
+                        index,
+                        channels,
+                        pct,
+                        deadline,
+                    }),
+                ])
             }
             Event::ToggleMute(kind, index) => {
                 let Some(mute) = self.muted(kind, index) else {
@@ -313,7 +324,30 @@ impl State {
                 self.error = None;
                 Task::none()
             }
+            Event::Expire(kind, index, deadline) => {
+                if self
+                    .targets
+                    .get(&(kind, index))
+                    .is_some_and(|target| target.2 == deadline)
+                {
+                    self.targets.remove(&(kind, index));
+                    return send(Command::Resync);
+                }
+                Task::none()
+            }
+            Event::Rejected(kind, index, deadline) => {
+                if self
+                    .targets
+                    .get(&(kind, index))
+                    .is_some_and(|target| target.2 == deadline)
+                {
+                    self.targets.remove(&(kind, index));
+                    self.error = Some("Audio server refused the volume change".into());
+                }
+                Task::none()
+            }
             Event::Failed(error) => {
+                self.targets.clear();
                 self.error = Some(error);
                 Task::none()
             }
@@ -331,36 +365,28 @@ impl State {
         // waybar's `group/pulseaudio` drew the microphone first.
         if let Some(source) = self.source() {
             let pct = self.shown(Kind::Source, source.index, source.pct);
-            row = row.push(
-                crate::theme::label(
-                    if source.mute { MIC_MUTED } else { MIC },
-                    format!("{pct}%"),
-                    ctx.font_size,
-                    // `.source-muted` dimmed the mic to `@hover-fg`.
-                    cosmic::theme::Text::Color(if source.mute {
-                        palette.overlay0
-                    } else {
-                        palette.fg()
-                    }),
-                ),
-            );
-        }
-
-        let pct = self.shown(Kind::Sink, sink.index, sink.pct);
-        row = row.push(
-            crate::theme::label(
-                sink.form.glyph(sink.mute, pct),
+            row = row.push(crate::theme::label(
+                if source.mute { MIC_MUTED } else { MIC },
                 format!("{pct}%"),
                 ctx.font_size,
-                // A muted output is the state worth noticing, so it goes red
-                // rather than taking waybar's flat dimming.
-                cosmic::theme::Text::Color(if sink.mute {
-                    palette.red
+                // `.source-muted` dimmed the mic to `@hover-fg`.
+                cosmic::theme::Text::Color(if source.mute {
+                    palette.overlay0
                 } else {
                     palette.fg()
                 }),
-            ),
-        );
+            ));
+        }
+
+        let pct = self.shown(Kind::Sink, sink.index, sink.pct);
+        row = row.push(crate::theme::label(
+            sink.form.glyph(sink.mute, pct),
+            format!("{pct}%"),
+            ctx.font_size,
+            // A muted output is the state worth noticing, so it goes red
+            // rather than taking waybar's flat dimming.
+            cosmic::theme::Text::Color(if sink.mute { palette.red } else { palette.fg() }),
+        ));
 
         // Right-click (mute) is the bar's own, from `Modules::right_click`, so
         // every cell answers the same button the same way.
@@ -518,11 +544,20 @@ impl State {
     }
 
     fn target(&self, kind: Kind, index: u32) -> Option<u32> {
-        self.targets.get(&(kind, index)).map(|&(pct, _)| pct)
+        self.targets.get(&(kind, index)).map(|&(pct, _, _)| pct)
     }
 
-    fn aim(&mut self, kind: Kind, index: u32, pct: u32) {
-        self.targets.insert((kind, index), (pct, TARGET_PATIENCE));
+    fn aim(&mut self, kind: Kind, index: u32, pct: u32) -> (Task<Message>, Instant) {
+        let deadline = Instant::now() + TARGET_TIMEOUT;
+        self.targets
+            .insert((kind, index), (pct, TARGET_PATIENCE, deadline));
+        (
+            Task::future(async move {
+                tokio::time::sleep_until(deadline.into()).await;
+                cosmic::Action::App(event_message(Event::Expire(kind, index, deadline)))
+            }),
+            deadline,
+        )
     }
 
     /// Drop targets the daemon has caught up with, and give up on the ones it
@@ -535,7 +570,7 @@ impl State {
             streams,
             ..
         } = self;
-        targets.retain(|&(target_kind, index), (pct, patience)| {
+        targets.retain(|&(target_kind, index), (pct, patience, _)| {
             if target_kind != kind {
                 return true;
             }
@@ -644,6 +679,7 @@ enum Command {
         index: u32,
         channels: u8,
         pct: u32,
+        deadline: Instant,
     },
     Mute {
         kind: Kind,
@@ -876,19 +912,32 @@ fn run(
                     index,
                     channels,
                     pct,
+                    deadline,
                 } => {
                     let mut volumes = ChannelVolumes::default();
                     volumes.set(channels.max(1), from_pct(pct));
                     let mut introspect = context.introspect();
                     match kind {
                         Kind::Sink => {
-                            introspect.set_sink_volume_by_index(index, &volumes, None);
+                            introspect.set_sink_volume_by_index(
+                                index,
+                                &volumes,
+                                Some(volume_result(kind, index, deadline)),
+                            );
                         }
                         Kind::Source => {
-                            introspect.set_source_volume_by_index(index, &volumes, None);
+                            introspect.set_source_volume_by_index(
+                                index,
+                                &volumes,
+                                Some(volume_result(kind, index, deadline)),
+                            );
                         }
                         Kind::Stream => {
-                            introspect.set_sink_input_volume(index, &volumes, None);
+                            introspect.set_sink_input_volume(
+                                index,
+                                &volumes,
+                                Some(volume_result(kind, index, deadline)),
+                            );
                         }
                     }
                 }
@@ -921,6 +970,15 @@ fn run(
         }
         mainloop.unlock();
     }
+}
+
+/// Report a refused write even when it produces no subscription event.
+fn volume_result(kind: Kind, index: u32, deadline: Instant) -> Box<dyn FnMut(bool)> {
+    Box::new(move |success| {
+        if !success {
+            PULSE.emit(Event::Rejected(kind, index, deadline));
+        }
+    })
 }
 
 /// Keep only the last command per key, in place, preserving order.
@@ -1101,4 +1159,75 @@ fn to_pct(volume: Volume) -> u32 {
 fn from_pct(pct: u32) -> Volume {
     let normal = Volume::NORMAL.0 as u64;
     Volume(((pct.min(MAX_PCT) as u64 * normal + 50) / 100) as u32)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_timeout_cannot_discard_a_newer_volume_target() {
+        let mut state = State::default();
+        let old = Instant::now();
+        let new = old + Duration::from_millis(1);
+        state
+            .targets
+            .insert((Kind::Sink, 1), (60, TARGET_PATIENCE, new));
+        let _ = state.update(Event::Expire(Kind::Sink, 1, old));
+        assert_eq!(state.target(Kind::Sink, 1), Some(60));
+    }
+
+    #[test]
+    fn an_earlier_rejection_does_not_discard_a_newer_target() {
+        let mut state = State::default();
+        let old = Instant::now() - Duration::from_millis(1);
+        state
+            .targets
+            .insert((Kind::Sink, 1), (70, TARGET_PATIENCE, Instant::now()));
+        let _ = state.update(Event::Rejected(Kind::Sink, 1, old));
+        assert_eq!(state.target(Kind::Sink, 1), Some(70));
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn a_delayed_rejection_cannot_discard_a_repeated_target_value() {
+        let mut state = State::default();
+        let old = Instant::now();
+        let new = old + Duration::from_millis(1);
+        state
+            .targets
+            .insert((Kind::Sink, 1), (60, TARGET_PATIENCE, new));
+        state
+            .targets
+            .insert((Kind::Source, 2), (40, TARGET_PATIENCE, new));
+        let _ = state.update(Event::Rejected(Kind::Sink, 1, old));
+        assert_eq!(state.target(Kind::Sink, 1), Some(60));
+        assert_eq!(state.target(Kind::Source, 2), Some(40));
+    }
+
+    #[test]
+    fn a_target_expires_even_without_further_daemon_snapshots() {
+        let mut state = State::default();
+        let deadline = Instant::now();
+        state
+            .targets
+            .insert((Kind::Sink, 1), (60, TARGET_PATIENCE, deadline));
+        let _ = state.update(Event::Expire(Kind::Sink, 1, deadline));
+        assert_eq!(state.shown(Kind::Sink, 1, 30), 30);
+    }
+
+    #[test]
+    fn volume_failure_restores_the_reported_value_without_waiting_for_snapshots() {
+        let mut state = State::default();
+        state
+            .targets
+            .insert((Kind::Sink, 1), (60, TARGET_PATIENCE, Instant::now()));
+        let deadline = state.targets[&(Kind::Sink, 1)].2;
+        let _ = state.update(Event::Rejected(Kind::Sink, 1, deadline));
+        assert_eq!(state.shown(Kind::Sink, 1, 30), 30);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Audio server refused the volume change")
+        );
+    }
 }

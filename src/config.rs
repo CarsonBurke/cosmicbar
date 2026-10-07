@@ -164,7 +164,7 @@ impl Config {
     pub fn load() -> Self {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
+            Ok(text) => match Self::parse(&text) {
                 Ok(config) => {
                     log::info!("loaded {}", path.display());
                     Self::indexed(config)
@@ -180,6 +180,21 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let config: Self = toml::from_str(text)?;
+        // The layer protocol represents the exclusive zone as a signed i32,
+        // and zero height is invalid when top and bottom are not both anchored.
+        anyhow::ensure!(
+            config.height > 0 && config.height <= i32::MAX as u32,
+            "height must be positive and fit the layer surface exclusive zone"
+        );
+        anyhow::ensure!(
+            config.font_size.is_finite() && config.font_size > 0.0,
+            "font_size must be finite and positive"
+        );
+        Ok(config)
     }
 
     /// Modification time of the config file, if it exists.
@@ -347,6 +362,11 @@ impl Config {
         crate::theme::Palette::by_name(&self.palette)
     }
 
+    pub fn wants_output(&self, name: Option<&str>) -> bool {
+        self.outputs.is_empty()
+            || name.is_some_and(|name| self.outputs.iter().any(|wanted| wanted == name))
+    }
+
     /// Every module placed in any region, in layout order.
     pub fn modules(&self) -> impl Iterator<Item = ModuleId> + '_ {
         self.left
@@ -393,5 +413,27 @@ impl Config {
         self.extensions
             .iter()
             .find(|entry| ModuleId::extension(&entry.name) == module)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_geometry() {
+        for text in [
+            "height = 0",
+            "height = 2147483648",
+            "font_size = 0.0",
+            "font_size = -1.0",
+            "font_size = nan",
+            "font_size = inf",
+            "font_size = -inf",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text}");
+        }
+        assert!(Config::parse("height = 1\nfont_size = 0.5").is_ok());
+        assert!(Config::parse("height = 2147483647\nfont_size = 1000.0").is_ok());
     }
 }

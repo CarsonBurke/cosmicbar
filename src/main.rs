@@ -23,6 +23,8 @@ fn main() -> cosmic::iced::Result {
 
     // `cosmicbar toggle network` talks to the running bar instead of starting one.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Loading placements also registers extension names for command validation.
+    let config = config::Config::load();
     if !args.is_empty() {
         let line = args.join(" ");
         if let Err(error) = control::send(&line) {
@@ -31,8 +33,6 @@ fn main() -> cosmic::iced::Result {
         }
         return Ok(());
     }
-
-    let config = config::Config::load();
 
     theme::set_font(theme::font(config.font_weight_bold));
     theme::set_icon_font(theme::icon_font(config.font_weight_bold));

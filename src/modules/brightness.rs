@@ -7,12 +7,12 @@
 //! Here one module owns both backends, the popup has a real slider per display,
 //! and scrolling the bar cell nudges the monitor that bar is drawn on.
 //!
-//! Backends, in order of preference:
+//! Both hardware backends are discovered independently:
 //!
 //! * `/sys/class/backlight/*` when a panel exists. Reads come from sysfs;
 //!   writes go through logind's `Session.SetBrightness`, which is why this needs
 //!   no root, no udev rule and no `brightnessctl` suid helper.
-//! * DDC/CI over i2c otherwise, by running `ddcutil` as a child process — there
+//! * DDC/CI over i2c for external monitors, by running `ddcutil` as a child process — there
 //!   is no Rust binding for it. Measured on this machine: `ddcutil detect
 //!   --brief` ≈ 0.8 s, and each `getvcp`/`setvcp` ≈ 0.28 s. That is far too slow
 //!   to touch from a view, so displays are detected once, values are cached and
@@ -29,9 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cosmic::app::Task;
-use cosmic::iced::futures::{SinkExt, Stream};
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
+use cosmic::iced::futures::{SinkExt, Stream};
 use cosmic::iced::{Length, Rectangle, Size, Subscription, Vector, mouse};
 use cosmic::widget;
 use cosmic::{Apply, Element};
@@ -67,9 +67,9 @@ const ICON_INACTIVE: &str = "\u{f043d}";
 const DDC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-read interval while the popup is open, so a change made elsewhere shows up.
 const REFRESH: Duration = Duration::from_secs(3);
-/// Retry interval while no display has been found yet (monitor plugged in later).
+/// Discovery retry interval; known displays are checked only with the popup open.
 const DETECT_RETRY: Duration = Duration::from_secs(60);
-/// sysfs panels never go fully dark, mirroring `brightnessctl -n`.
+/// Minimum raw hardware level: even low-resolution panels stay lit.
 const SYSFS_FLOOR: u32 = 1;
 
 /// Where one display's brightness is read and written.
@@ -89,7 +89,7 @@ impl Sink {
     /// steps reads 30% back as 29%.
     fn raw(&self, percent: u32) -> u32 {
         match self {
-            Self::Backlight { max, .. } => from_percent(percent.max(SYSFS_FLOOR), *max),
+            Self::Backlight { max, .. } => from_percent(percent, *max).max(SYSFS_FLOOR).min(*max),
             Self::Ddc { max, .. } => from_percent(percent, *max),
         }
     }
@@ -107,10 +107,13 @@ pub struct Found {
 }
 
 impl Found {
-    /// What a mode calls this display: its connector, which is stable across
-    /// replugs and matches the compositor's name for it, or else its label.
+    /// Keep existing panel mode keys (the backlight device name), while
+    /// external monitors use their connector when available.
     fn key(&self) -> &str {
-        self.connector.as_deref().unwrap_or(&self.label)
+        match self.sink {
+            Sink::Backlight { .. } => &self.label,
+            Sink::Ddc { .. } => self.connector.as_deref().unwrap_or(&self.label),
+        }
     }
 }
 
@@ -120,24 +123,35 @@ struct Display {
     /// Newest value the user asked for while a write was in flight.
     pending: Option<u32>,
     writing: bool,
+    write_id: u64,
+    row_id: u64,
 }
 
 /// What a click or a scroll applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
-    One(usize),
+    One(Sink),
     All,
 }
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Detected(Arc<Vec<Found>>),
+    Rediscover,
+    Detected {
+        revision: u64,
+        found: Arc<Vec<Found>>,
+        /// False only when enumeration itself failed.
+        ddc_complete: bool,
+        /// Enumerated buses whose brightness could not be read this time.
+        failed_buses: Arc<Vec<u32>>,
+    },
     /// Live values from the popup-only refresh.
     Refreshed(Arc<Vec<(Sink, u32)>>),
     Set(Target, u32),
     Nudge(Target, i32),
     Wrote {
-        index: usize,
+        sink: Sink,
+        write_id: u64,
         percent: u32,
         result: Result<(), String>,
     },
@@ -156,7 +170,9 @@ pub enum Event {
     /// Text typed into the editor's name.
     Typed(String),
     /// Backspace; with Ctrl, the whole last word.
-    Erase { word: bool },
+    Erase {
+        word: bool,
+    },
     SaveMode,
     DeleteMode,
     CancelEdit,
@@ -174,6 +190,10 @@ struct Editor {
 #[derive(Debug, Default)]
 pub struct State {
     displays: Vec<Display>,
+    discovery_revision: u64,
+    discovery_requested: bool,
+    writes: u64,
+    display_ids: u64,
     /// When the last wheel notch was accepted; see [`NUDGE_DEBOUNCE`].
     nudged_at: Option<Instant>,
     error: Option<String>,
@@ -194,9 +214,9 @@ pub struct State {
 
 impl State {
     pub fn subscription(&self, open: bool) -> Subscription<Message> {
-        if self.displays.is_empty() {
+        if self.displays.is_empty() || (!open && self.discovery_requested) {
             // Detection is the only thing worth doing until something is found.
-            return Subscription::run(detect);
+            return Subscription::run_with((self.discovery_revision, open), detect);
         }
         if !open {
             // Nobody is looking, and a DDC read costs a third of a second.
@@ -213,6 +233,7 @@ impl State {
             .map(|display| display.found.sink.clone())
             .collect();
         Subscription::batch([
+            Subscription::run_with((self.discovery_revision, true), detect),
             Subscription::run_with(sinks, |sinks| refresh(sinks.clone())),
             typing,
         ])
@@ -220,16 +241,52 @@ impl State {
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
         match event {
-            Event::Detected(found) => {
-                self.displays = found
-                    .iter()
-                    .cloned()
-                    .map(|found| Display {
+            Event::Rediscover => {
+                self.discovery_revision = self.discovery_revision.wrapping_add(1);
+                self.discovery_requested = true;
+                Task::none()
+            }
+            Event::Detected {
+                revision,
+                found,
+                ddc_complete,
+                failed_buses,
+            } => {
+                if revision != self.discovery_revision {
+                    return Task::none();
+                }
+                self.discovery_requested = false;
+                let mut found = found.as_ref().clone();
+                for mut display in std::mem::take(&mut self.displays) {
+                    if let Some(index) = found
+                        .iter()
+                        .position(|found| found.sink == display.found.sink)
+                    {
+                        let updated = found.remove(index);
+                        let percent = display.found.percent;
+                        display.found = updated;
+                        if display.writing || display.pending.is_some() {
+                            display.found.percent = percent;
+                        }
+                        self.displays.push(display);
+                    } else if matches!(display.found.sink, Sink::Ddc { bus, .. } if !ddc_complete || failed_buses.contains(&bus))
+                    {
+                        // Retain known monitors after a failed enumeration, or
+                        // an explicitly failed read. An unrelated failed monitor
+                        // must not preserve a display absent from enumeration.
+                        self.displays.push(display);
+                    }
+                }
+                for found in found {
+                    self.display_ids = self.display_ids.wrapping_add(1);
+                    self.displays.push(Display {
                         found,
                         pending: None,
                         writing: false,
-                    })
-                    .collect();
+                        write_id: 0,
+                        row_id: self.display_ids,
+                    });
+                }
                 Task::none()
             }
             Event::Refreshed(values) => {
@@ -277,7 +334,10 @@ impl State {
                 }
                 // A save that failed left edits only in memory; the file is
                 // the truth now, but say where they went.
-                let unsaved = self.modes_readable.then_some(()).and(self.modes_error.take());
+                let unsaved = self
+                    .modes_readable
+                    .then_some(())
+                    .and(self.modes_error.take());
                 self.modes_readable = true;
                 // `cosmicbar reload` follows every config.toml save; only a
                 // changed file disturbs the editor and the cycling position.
@@ -287,7 +347,11 @@ impl State {
                     self.modes = modes;
                     self.last_mode = None;
                     // The list may have been reordered under an open editor.
-                    if self.editor.as_ref().is_some_and(|editor| editor.target.is_some()) {
+                    if self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.target.is_some())
+                    {
                         self.editor = None;
                     }
                 }
@@ -419,10 +483,21 @@ impl State {
                 Task::none()
             }
             Event::Wrote {
-                index,
+                sink,
+                write_id,
                 percent,
                 result,
             } => {
+                let Some(index) = self
+                    .displays
+                    .iter()
+                    .position(|display| display.found.sink == sink)
+                else {
+                    return Task::none();
+                };
+                if self.displays[index].write_id != write_id {
+                    return Task::none();
+                }
                 if let Err(error) = &result {
                     log::warn!("brightness write failed: {error}");
                 }
@@ -446,7 +521,7 @@ impl State {
             return None;
         }
         let target = self.target(ctx);
-        let percent = self.percent(target);
+        let percent = self.percent(&target);
         let color = if self.error.is_some() {
             ctx.palette.red
         } else {
@@ -464,7 +539,7 @@ impl State {
             // which would eat the bar's popup toggle.
             .apply(|label| {
                 Wheel::new(label, move |delta| {
-                    event_message(Event::Nudge(target, steps(delta)))
+                    event_message(Event::Nudge(target.clone(), steps(delta)))
                 })
             })
             .into(),
@@ -481,45 +556,60 @@ impl State {
         if self.displays.is_empty() {
             return None;
         }
-        let mut card = Card::new();
-        for (index, display) in self.displays.iter().enumerate() {
+        let mut displays = cosmic::iced::widget::keyed::Column::new().width(Length::Fill);
+        for display in &self.displays {
+            let sink = display.found.sink.clone();
             let percent = display.found.percent;
             let value: Element<'_, Message> = popup::item(format!("{percent}%"), ctx)
                 .class(cosmic::theme::Text::Color(ctx.palette.accent()))
                 .into();
-            card = card.block(
-                popup::column()
-                    .push(popup::section(heading(&display.found), ctx))
-                    .push(popup::split(
-                        widget::slider(0..=100, percent, move |percent| {
-                            event_message(Event::Set(Target::One(index), percent))
-                        })
-                        .step(1u32),
-                        [value],
-                    )),
+            let content = Card::new()
+                .block(
+                    popup::column()
+                        .push(popup::section(heading(&display.found), ctx))
+                        .push(popup::split(
+                            widget::slider(0..=100, percent, move |percent| {
+                                event_message(Event::Set(Target::One(sink.clone()), percent))
+                            })
+                            .step(1u32),
+                            [value],
+                        )),
+                )
+                .build();
+            displays = displays.push(
+                display.row_id,
+                widget::Column::new()
+                    .push(content)
+                    .push(widget::divider::horizontal::default()),
             );
         }
 
         // The presets move every display at once, which is what makes them the
         // card's footer rather than a control inside one display's block.
+        let footer = Card::new().block(self.modes_block(ctx));
         Some(
-            card.block(self.modes_block(ctx))
-                .block(popup::split(
-                popup::detail("all", ctx),
-                PRESETS.map(|preset| {
-                    popup::chip(
-                        format!("{preset}%"),
-                        Chip::Plain,
-                        ctx,
-                        Some(event_message(Event::Set(Target::All, preset))),
-                    )
-                }),
-            ))
-            .maybe(self.error.as_ref().map(|error| {
-                popup::detail(error.as_str(), ctx)
-                    .class(cosmic::theme::Text::Color(ctx.palette.red))
-            }))
-            .build(),
+            widget::Column::new()
+                .push(displays)
+                .push(
+                    footer
+                        .block(popup::split(
+                            popup::detail("all", ctx),
+                            PRESETS.map(|preset| {
+                                popup::chip(
+                                    format!("{preset}%"),
+                                    Chip::Plain,
+                                    ctx,
+                                    Some(event_message(Event::Set(Target::All, preset))),
+                                )
+                            }),
+                        ))
+                        .maybe(self.error.as_ref().map(|error| {
+                            popup::detail(error.as_str(), ctx)
+                                .class(cosmic::theme::Text::Color(ctx.palette.red))
+                        }))
+                        .build(),
+                )
+                .into(),
         )
     }
 
@@ -593,11 +683,7 @@ impl State {
                 .spacing(popup::ROW_GAP)
                 .align_y(cosmic::iced::Alignment::Center);
             block = block.push(popup::split(
-                popup::row(
-                    label,
-                    palette,
-                    Some(event_message(Event::ApplyMode(index))),
-                ),
+                popup::row(label, palette, Some(event_message(Event::ApplyMode(index)))),
                 [popup::icon_chip(
                     ICON_EDIT,
                     Chip::Plain,
@@ -616,8 +702,7 @@ impl State {
         }
         block
             .push_maybe(self.modes_error.as_ref().map(|error| {
-                popup::detail(error.as_str(), ctx)
-                    .class(cosmic::theme::Text::Color(palette.red))
+                popup::detail(error.as_str(), ctx).class(cosmic::theme::Text::Color(palette.red))
             }))
             .into()
     }
@@ -711,14 +796,13 @@ impl State {
             return Task::none();
         };
         self.last_mode = Some(index);
-        let targets: Vec<(usize, u32)> = self
+        let targets: Vec<(Sink, u32)> = self
             .displays
             .iter()
-            .enumerate()
-            .filter_map(|(at, display)| {
+            .filter_map(|display| {
                 mode.levels
                     .get(display.found.key())
-                    .map(|level| (at, (*level).min(100)))
+                    .map(|level| (display.found.sink.clone(), (*level).min(100)))
             })
             .collect();
         Task::batch(
@@ -748,11 +832,12 @@ impl State {
                     .connector
                     .as_deref()
                     .is_some_and(|connector| connector == output)
-            }) {
-                return Target::One(index);
-            }
+            })
+        {
+            return Target::One(self.displays[index].found.sink.clone());
+        }
         if self.displays.len() == 1 {
-            Target::One(0)
+            Target::One(self.displays[0].found.sink.clone())
         } else {
             Target::All
         }
@@ -760,11 +845,12 @@ impl State {
 
     /// The number the bar cell shows: one display's value, or the average when
     /// the cell speaks for all of them.
-    fn percent(&self, target: Target) -> u32 {
+    fn percent(&self, target: &Target) -> u32 {
         match target {
-            Target::One(index) => self
+            Target::One(sink) => self
                 .displays
-                .get(index)
+                .iter()
+                .find(|display| &display.found.sink == sink)
                 .map_or(0, |display| display.found.percent),
             Target::All if self.displays.is_empty() => 0,
             Target::All => {
@@ -781,7 +867,12 @@ impl State {
     /// Change one or every display, coalescing against writes in flight.
     fn apply(&mut self, target: Target, value: impl Fn(u32) -> u32) -> Task<Message> {
         let indices: Vec<usize> = match target {
-            Target::One(index) => vec![index],
+            Target::One(sink) => self
+                .displays
+                .iter()
+                .position(|display| display.found.sink == sink)
+                .into_iter()
+                .collect(),
             Target::All => (0..self.displays.len()).collect(),
         };
         let mut tasks = Vec::with_capacity(indices.len());
@@ -811,10 +902,14 @@ impl State {
             return Task::none();
         };
         display.writing = true;
+        self.writes = self.writes.wrapping_add(1);
+        let write_id = self.writes;
+        display.write_id = write_id;
         let sink = display.found.sink.clone();
         Task::future(async move {
             cosmic::Action::App(event_message(Event::Wrote {
-                index,
+                sink: sink.clone(),
+                write_id,
                 percent,
                 result: set(&sink, percent)
                     .await
@@ -892,22 +987,34 @@ fn steps(delta: mouse::ScrollDelta) -> i32 {
     }
 }
 
-/// Probe for displays until something answers.
-fn detect() -> impl Stream<Item = Message> {
+/// Discover both backend types. With known displays this worker exists only
+/// while the popup is open, so opening it also discovers hotplugged monitors.
+fn detect(request: &(u64, bool)) -> impl Stream<Item = Message> + use<> {
+    let revision = request.0;
     cosmic::iced::stream::channel(1, async move |mut sender| {
         loop {
-            let found = match backlights().await {
-                // A panel exists: DDC is not worth the seconds it costs.
-                found if !found.is_empty() => found,
-                _ => ddc_detect().await.unwrap_or_else(|error| {
+            let mut found = backlights().await;
+            let (ddc_complete, failed_buses) = match ddc_detect().await {
+                Ok((ddc, failed_buses)) => {
+                    found.extend(ddc);
+                    (true, failed_buses)
+                }
+                Err(error) => {
                     log::debug!("ddcutil detect: {error:#}");
-                    Vec::new()
-                }),
+                    (false, Vec::new())
+                }
             };
-            if !found.is_empty() {
-                let _ = sender
-                    .send(event_message(Event::Detected(Arc::new(found))))
-                    .await;
+            if sender
+                .send(event_message(Event::Detected {
+                    revision,
+                    found: Arc::new(found),
+                    ddc_complete,
+                    failed_buses: Arc::new(failed_buses),
+                }))
+                .await
+                .is_err()
+            {
+                return;
             }
             tokio::time::sleep(DETECT_RETRY).await;
         }
@@ -960,7 +1067,9 @@ fn to_percent(raw: u32, max: u32) -> u32 {
     if max == 0 {
         return 0;
     }
-    ((f64::from(raw) / f64::from(max)) * 100.0).round().min(100.0) as u32
+    ((f64::from(raw) / f64::from(max)) * 100.0)
+        .round()
+        .min(100.0) as u32
 }
 
 fn from_percent(percent: u32, max: u32) -> u32 {
@@ -994,7 +1103,11 @@ async fn backlights() -> Vec<Found> {
                 max,
             },
             label: name,
-            connector: None,
+            connector: tokio::fs::canonicalize(format!("{base}/device"))
+                .await
+                .ok()
+                .as_deref()
+                .and_then(backlight_connector),
         });
     }
     found
@@ -1002,6 +1115,19 @@ async fn backlights() -> Vec<Found> {
 
 async fn read_number(path: &str) -> anyhow::Result<u32> {
     Ok(tokio::fs::read_to_string(path).await?.trim().parse()?)
+}
+
+/// Kernel backlight devices commonly live below their DRM connector. Resolve
+/// that identity rather than treating a laptop panel as every attached display.
+fn backlight_connector(device: &std::path::Path) -> Option<String> {
+    device.ancestors().find_map(|ancestor| {
+        let name = ancestor.file_name()?.to_str()?;
+        let (card, connector) = name.strip_prefix("card")?.split_once('-')?;
+        (!card.is_empty()
+            && card.chars().all(|character| character.is_ascii_digit())
+            && !connector.is_empty())
+        .then(|| connector.to_owned())
+    })
 }
 
 /// Writes through logind, so the bar needs no privilege on
@@ -1020,21 +1146,22 @@ async fn set_backlight(name: &str, raw: u32) -> anyhow::Result<()> {
 }
 
 /// `ddcutil detect --brief`, parsed into one display per usable monitor.
-async fn ddc_detect() -> anyhow::Result<Vec<Found>> {
+async fn ddc_detect() -> anyhow::Result<(Vec<Found>, Vec<u32>)> {
     let output = ddcutil(&["detect", "--brief"]).await?;
     let mut found = Vec::new();
     let mut bus = None;
     let mut connector = None;
     let mut label = None;
 
-    let mut flush = |bus: &mut Option<u32>, connector: &mut Option<String>, label: &mut Option<String>| {
-        if let Some(bus) = bus.take() {
-            found.push((bus, connector.take(), label.take()));
-        } else {
-            connector.take();
-            label.take();
-        }
-    };
+    let mut flush =
+        |bus: &mut Option<u32>, connector: &mut Option<String>, label: &mut Option<String>| {
+            if let Some(bus) = bus.take() {
+                found.push((bus, connector.take(), label.take()));
+            } else {
+                connector.take();
+                label.take();
+            }
+        };
 
     for line in output.lines() {
         let line = line.trim();
@@ -1062,20 +1189,35 @@ async fn ddc_detect() -> anyhow::Result<Vec<Found>> {
     }
     flush(&mut bus, &mut connector, &mut label);
 
+    Ok(read_ddc_displays(found, ddc_get).await)
+}
+
+async fn read_ddc_displays<F, Fut>(
+    found: Vec<(u32, Option<String>, Option<String>)>,
+    mut read: F,
+) -> (Vec<Found>, Vec<u32>)
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = anyhow::Result<(u32, u32)>>,
+{
     let mut displays = Vec::with_capacity(found.len());
+    let mut failed_buses = Vec::new();
     for (bus, connector, label) in found {
         // A bus that will not answer VCP 0x10 has no brightness to offer.
-        match ddc_get(bus).await {
+        match read(bus).await {
             Ok((current, max)) => displays.push(Found {
                 percent: to_percent(current, max),
                 sink: Sink::Ddc { bus, max },
                 label: label.unwrap_or_else(|| format!("i2c-{bus}")),
                 connector,
             }),
-            Err(error) => log::debug!("ddc bus {bus}: {error:#}"),
+            Err(error) => {
+                failed_buses.push(bus);
+                log::debug!("ddc bus {bus}: {error:#}");
+            }
         }
     }
-    Ok(displays)
+    (displays, failed_buses)
 }
 
 /// `VCP 10 C <current> <max>`
@@ -1090,7 +1232,10 @@ async fn ddc_get(bus: u32) -> anyhow::Result<(u32, u32)> {
         .next()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("unparsable ddcutil value: {line}"))?;
-    let max = fields.next().and_then(|value| value.parse().ok()).unwrap_or(100);
+    let max = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100);
     Ok((current, max.max(1)))
 }
 
@@ -1230,9 +1375,13 @@ impl<Message> Widget<Message, cosmic::Theme, cosmic::Renderer> for Wheel<'_, Mes
         viewport: &Rectangle,
         renderer: &cosmic::Renderer,
     ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn draw(
@@ -1309,7 +1458,7 @@ mod tests {
         Display {
             found: Found {
                 sink: Sink::Ddc {
-                    bus: connector.len() as u32,
+                    bus: connector.bytes().map(u32::from).sum(),
                     max,
                 },
                 label: format!("{connector} monitor"),
@@ -1318,6 +1467,8 @@ mod tests {
             },
             pending: None,
             writing: false,
+            write_id: 0,
+            row_id: connector.bytes().last().unwrap_or_default() as u64,
         }
     }
 
@@ -1363,7 +1514,10 @@ mod tests {
     fn the_mode_in_effect_is_the_one_every_display_matches() {
         let mut state = state();
         assert_eq!(state.active_mode(), Some(0));
-        let _ = state.update(Event::Set(Target::One(0), 81));
+        let _ = state.update(Event::Set(
+            Target::One(state.displays[0].found.sink.clone()),
+            81,
+        ));
         assert_eq!(state.active_mode(), None);
     }
 
@@ -1389,7 +1543,9 @@ mod tests {
     #[test]
     fn cycling_moves_past_modes_that_share_levels() {
         let mut state = state();
-        state.modes.insert(1, mode("work", &[("DP-1", 80), ("DP-2", 70)]));
+        state
+            .modes
+            .insert(1, mode("work", &[("DP-1", 80), ("DP-2", 70)]));
         state.modes.push(mode("left", &[("DP-1", 80)]));
         let mut seen = Vec::new();
         for _ in 0..4 {
@@ -1445,7 +1601,13 @@ mod tests {
         assert_eq!(state.modes_error, None, "nothing was lost");
         let _ = state.update(Event::Saved(Err("disk full".into())));
         let _ = state.update(loaded(vec![mode("dusk", &[("DP-1", 40)])]));
-        assert!(state.modes_error.as_deref().unwrap().starts_with("disk full; unsaved"));
+        assert!(
+            state
+                .modes_error
+                .as_deref()
+                .unwrap()
+                .starts_with("disk full; unsaved")
+        );
     }
 
     #[test]
@@ -1485,7 +1647,10 @@ mod tests {
         state.modes[1].levels.insert("HDMI-A-1".into(), 30);
         let _ = state.update(Event::EditMode(1));
         assert_eq!(percents(&state), [20, 15]);
-        let _ = state.update(Event::Set(Target::One(1), 10));
+        let _ = state.update(Event::Set(
+            Target::One(state.displays[1].found.sink.clone()),
+            10,
+        ));
         // Ctrl+Backspace clears the one word, then the new name is typed.
         let _ = state.update(Event::Erase { word: true });
         let _ = state.update(Event::Typed("late".into()));
@@ -1554,5 +1719,259 @@ mod tests {
         assert_eq!(panel.raw(30), panel.raw(to_percent(panel.raw(30), 7)));
         // The floor: 0% on a panel is 1%, not off.
         assert_eq!(panel.raw(0), panel.raw(1));
+        assert_eq!(panel.raw(0), 1, "a low-resolution panel must stay lit");
+        assert_eq!(panel.raw(100), 7);
+        assert_eq!(Sink::Ddc { bus: 1, max: 7 }.raw(0), 0);
+    }
+
+    fn detected(state: &State, found: Vec<Found>, ddc_complete: bool) -> Event {
+        Event::Detected {
+            revision: state.discovery_revision,
+            found: Arc::new(found),
+            ddc_complete,
+            failed_buses: Arc::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn rediscovery_preserves_pending_writes_and_addresses_completions_by_sink() {
+        let mut state = state();
+        // Give each monitor a distinct hardware identity.
+        state.displays[1].found.sink = Sink::Ddc { bus: 2, max: 100 };
+        let sink = state.displays[0].found.sink.clone();
+        drop(state.update(Event::Set(
+            Target::One(state.displays[0].found.sink.clone()),
+            30,
+        )));
+        drop(state.update(Event::Set(
+            Target::One(state.displays[0].found.sink.clone()),
+            20,
+        )));
+        let reversed = state
+            .displays
+            .iter()
+            .rev()
+            .map(|display| display.found.clone())
+            .collect();
+        drop(state.update(detected(&state, reversed, true)));
+        assert!(state.displays[0].writing);
+        assert_eq!(state.displays[0].pending, Some(20));
+        drop(state.update(Event::Wrote {
+            sink,
+            write_id: state.displays[0].write_id,
+            percent: 30,
+            result: Ok(()),
+        }));
+        assert!(
+            state.displays[0].writing,
+            "the newest pending write starts on the same monitor"
+        );
+        assert_eq!(state.displays[0].pending, None);
+        assert!(!state.displays[1].writing);
+    }
+
+    #[test]
+    fn failed_ddc_scan_preserves_monitors_but_successful_empty_scan_removes_them() {
+        let mut state = state();
+        let panel = Found {
+            sink: Sink::Backlight {
+                name: "panel".into(),
+                max: 7,
+            },
+            label: "panel".into(),
+            connector: None,
+            percent: 50,
+        };
+        drop(state.update(detected(&state, vec![panel.clone()], false)));
+        assert_eq!(
+            state.displays.len(),
+            3,
+            "internal and external monitors coexist"
+        );
+        drop(state.update(detected(&state, vec![panel], true)));
+        assert_eq!(state.displays.len(), 1);
+        drop(state.update(detected(&state, vec![], true)));
+        assert!(state.displays.is_empty());
+    }
+
+    #[test]
+    fn reload_invalidates_an_old_discovery_result() {
+        let mut state = state();
+        let stale = detected(&state, vec![], true);
+        drop(state.update(Event::Rediscover));
+        assert!(state.discovery_requested);
+        drop(state.update(stale));
+        assert_eq!(state.displays.len(), 2);
+        assert!(state.discovery_requested);
+    }
+
+    #[test]
+    fn stale_write_from_a_removed_display_cannot_finish_a_new_write() {
+        let mut state = state();
+        drop(state.update(Event::Set(
+            Target::One(state.displays[0].found.sink.clone()),
+            30,
+        )));
+        let sink = state.displays[0].found.sink.clone();
+        let old_write = state.displays[0].write_id;
+        let found = state.displays[0].found.clone();
+        drop(state.update(detected(&state, vec![], true)));
+        drop(state.update(detected(&state, vec![found], true)));
+        drop(state.update(Event::Set(
+            Target::One(state.displays[0].found.sink.clone()),
+            40,
+        )));
+        drop(state.update(Event::Wrote {
+            sink,
+            write_id: old_write,
+            percent: 30,
+            result: Ok(()),
+        }));
+        assert!(state.displays[0].writing);
+        assert_eq!(state.displays[0].found.percent, 40);
+    }
+
+    #[test]
+    fn panel_connector_comes_from_its_drm_device_ancestry() {
+        assert_eq!(
+            backlight_connector(std::path::Path::new(
+                "/sys/devices/pci/drm/card1/card1-eDP-1/backlight/panel"
+            )),
+            Some("eDP-1".into())
+        );
+        assert_eq!(
+            backlight_connector(std::path::Path::new("/sys/devices/pci/drm/card1")),
+            None
+        );
+    }
+
+    #[test]
+    fn captured_slider_targets_survive_reordering_and_ignore_removed_monitors() {
+        let mut state = state();
+        let first = Target::One(state.displays[0].found.sink.clone());
+        let second = Target::One(state.displays[1].found.sink.clone());
+        let row_ids: Vec<_> = state
+            .displays
+            .iter()
+            .map(|display| display.row_id)
+            .collect();
+        let reverse = state
+            .displays
+            .iter()
+            .rev()
+            .map(|display| display.found.clone())
+            .collect();
+        drop(state.update(detected(&state, reverse, true)));
+        assert_eq!(
+            state
+                .displays
+                .iter()
+                .map(|display| display.row_id)
+                .collect::<Vec<_>>(),
+            row_ids
+        );
+        drop(state.update(Event::Set(first.clone(), 25)));
+        assert_eq!(percents(&state), [25, 70]);
+        let remaining = state.displays[1].found.clone();
+        drop(state.update(detected(&state, vec![remaining], true)));
+        assert_eq!(state.displays[0].row_id, row_ids[1]);
+        drop(state.update(Event::Set(first, 10)));
+        assert_eq!(
+            percents(&state),
+            [70],
+            "a removed slider cannot target its replacement row"
+        );
+        drop(state.update(Event::Set(second, 15)));
+        assert_eq!(
+            percents(&state),
+            [15],
+            "a surviving slider retains its hardware target"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_monitor_reads_keep_the_failed_display_until_a_complete_unplug_scan() {
+        let mut state = state();
+        let enumerated = state
+            .displays
+            .iter()
+            .map(|display| {
+                let Sink::Ddc { bus, .. } = display.found.sink else {
+                    unreachable!()
+                };
+                (
+                    bus,
+                    display.found.connector.clone(),
+                    Some(display.found.label.clone()),
+                )
+            })
+            .collect();
+        let Sink::Ddc {
+            bus: failed_bus, ..
+        } = state.displays[1].found.sink
+        else {
+            unreachable!()
+        };
+        let (found, failed_buses) = read_ddc_displays(enumerated, |bus| async move {
+            if bus == failed_bus {
+                anyhow::bail!("temporary VCP read failure")
+            }
+            Ok((50, 100))
+        })
+        .await;
+        assert_eq!(failed_buses, [failed_bus]);
+        assert_eq!(found.len(), 1);
+        drop(state.update(Event::Detected {
+            revision: state.discovery_revision,
+            found: Arc::new(found.clone()),
+            ddc_complete: true,
+            failed_buses: Arc::new(failed_buses),
+        }));
+        assert_eq!(percents(&state), [50, 70]);
+        drop(state.update(detected(&state, found, true)));
+        assert_eq!(
+            percents(&state),
+            [50],
+            "a complete scan can remove an unplugged monitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_monitor_does_not_preserve_an_unplugged_supported_display() {
+        let mut state = state();
+        let Sink::Ddc {
+            bus: supported_bus, ..
+        } = state.displays[0].found.sink
+        else {
+            unreachable!()
+        };
+        let unsupported_bus = 999;
+        // DP-2 is absent from a successful enumeration; the new display on
+        // another bus is present but does not implement brightness VCP.
+        let enumerated = vec![
+            (supported_bus, Some("DP-1".into()), Some("supported".into())),
+            (
+                unsupported_bus,
+                Some("HDMI-A-1".into()),
+                Some("unsupported".into()),
+            ),
+        ];
+        let (found, failed_buses) = read_ddc_displays(enumerated, |bus| async move {
+            if bus == unsupported_bus {
+                anyhow::bail!("VCP 10 unsupported")
+            }
+            Ok((50, 100))
+        })
+        .await;
+        assert_eq!(failed_buses, [unsupported_bus]);
+        drop(state.update(Event::Detected {
+            revision: state.discovery_revision,
+            found: Arc::new(found),
+            ddc_complete: true,
+            failed_buses: Arc::new(failed_buses),
+        }));
+        assert_eq!(state.displays.len(), 1);
+        assert_eq!(state.displays[0].found.connector.as_deref(), Some("DP-1"));
+        assert_eq!(percents(&state), [50]);
     }
 }

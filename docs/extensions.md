@@ -97,6 +97,11 @@ it as destructive.
 
 Colours are palette roles, never hex, so an extension follows the bar's theme:
 `fg`, `muted`, `faint`, `accent`, `green`, `yellow`, `peach`, `red`.
+The `faint` role keeps secondary text readable in both light and dark palettes.
+
+While an extension reconnects, its last frame stays visible with a reconnecting
+status and disabled controls. A restarted or reconfigured program must send a
+fresh frame before its actions become available again.
 
 ## Rules that keep the bar cheap
 

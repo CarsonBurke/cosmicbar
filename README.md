@@ -26,13 +26,14 @@ for anything that is not a label.
   MPRIS, the tray and inotify for the config file all deliver events, so no
   module sits on an interval and no `exec` script runs on a timer. The bar's own
   clock is a minute-aligned tick for the cells that show wall-clock time, and it
-  only goes to one second while a playing MPRIS popup or an armed power
-  confirmation is on screen. What the kernel exposes no event for is sampled
+  only goes to one second while a playing MPRIS popup is on screen.
+  What the kernel exposes no event for is sampled
   in-process instead - `/proc` for CPU and memory, NVML for the GPU, every 2s, no
   fork per reading - and detail nobody is looking at (per-process CPU share,
   per-process VRAM, DDC values) is only gathered while its popup is open. Three
   things run a program because there is no library to call: `ddcutil` for
-  external monitors, whose `detect` retries once a minute until one answers, and
+  external monitors, discovered at startup, on reload and while the brightness
+  popup is open (retrying once a minute when no display is found), and
   `checkupdates` plus your AUR helper's `-Qua` every 30 minutes.
 - **Real widgets.** A cell opens a popup surface with working controls: pick a
   wifi network, connect a headset, switch audio sink, kill a process, jump to a
@@ -73,7 +74,9 @@ keybinds.
 
 `~/.config/cosmicbar/config.toml`, re-read when it changes. Every field is
 optional and shown below at its default; an unrecognised key is rejected rather
-than ignored, and the bar logs and runs on defaults.
+than ignored, and the bar logs and runs on defaults. Height must be positive
+and font size finite and positive. Saving applies output filters, layer and
+font changes to the running bar, including outputs that were previously hidden.
 
 ```toml
 height = 24
@@ -118,6 +121,12 @@ Placing a module is what starts its subscription; leaving it out costs nothing.
 Three cells have nothing to open: `workspaces` and `idle_inhibitor` act on the
 click itself, and `time` says all it has to say in the bar.
 
+The center region stays centered when it fits between the edges. On narrow
+outputs it moves into the free space; if the regions still cannot fit, each
+gets a separate horizontal scroll area. Scroll over passive cells or drag the
+small scrollbar to reach hidden controls. Volume and brightness retain their
+normal wheel actions, and popups follow the visible part of a scrolled cell.
+
 The calendar popup shows the selected date's events beside the month grid, using
 the enabled, selected calendars shared with GNOME Calendar. Clicking a date or
 browsing months loads that day's agenda. While open, it subscribes to event and
@@ -130,11 +139,22 @@ Data Server (`evolution-data-server` on Arch); no interpreter or GI runtime is
 used. Configure accounts and calendar visibility in GNOME Calendar. If the
 backend is unavailable, the date grid still works and the agenda shows an error.
 The updates module is independent of Pamac and its tray: it uses `checkupdates`
-and an installed AUR helper.
+and an installed AUR helper. Failed checks remain visible instead of implying
+that everything is up to date. An upgrade stops if a package manager fails and
+reports completion only after every step succeeds.
 
 The tray hosts its own StatusNotifierWatcher or uses an existing one, including
 KDE's. Watcher unregister signals remove exited apps and withdrawn items
 immediately, without polling; removing the selected item also closes its menu.
+Unavailable items do not prevent later applications from appearing.
+
+The power popup asks for confirmation before logging out, rebooting or powering
+off. Cancel or dismiss the popup to return to the normal menu.
+
+Brightness discovers internal panels and external monitors together. Open its
+popup or reload to discover newly connected displays; background DDC reads stop
+when the popup closes once displays are known. Internal panels retain a minimum
+of one hardware step.
 
 Brightness modes (`day`, `night`, …) store a level for each display, so
 monitors can differ. To add one, set the sliders, press + in the brightness

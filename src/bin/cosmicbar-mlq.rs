@@ -437,15 +437,15 @@ fn commands(events: Sender<Event>, actions: Sender<String>) {
                 continue;
             }
         };
-        if let Some(popup) = message.get("popup").and_then(Value::as_bool) {
-            if events.send(Event::Popup(popup)).is_err() {
-                return;
-            }
+        if let Some(popup) = message.get("popup").and_then(Value::as_bool)
+            && events.send(Event::Popup(popup)).is_err()
+        {
+            return;
         }
-        if let Some(action) = message.get("action").and_then(Value::as_str) {
-            if actions.send(action.to_owned()).is_err() {
-                return;
-            }
+        if let Some(action) = message.get("action").and_then(Value::as_str)
+            && actions.send(action.to_owned()).is_err()
+        {
+            return;
         }
     }
     // EOF must stop even a blocked socket read, slow mutation, or stdout write.

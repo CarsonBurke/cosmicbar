@@ -484,7 +484,7 @@ fn top_processes() -> Vec<TopProcess> {
         ranked.push((pid, resident * PAGE_BYTES));
     }
 
-    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
     ranked.truncate(TOP_PROCESSES);
     ranked
         .into_iter()

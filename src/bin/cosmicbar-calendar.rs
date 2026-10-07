@@ -19,7 +19,12 @@ use std::{
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    unnecessary_transmutes
+    unnecessary_transmutes,
+    // Generated C bindings preserve C names, signatures and layout idioms.
+    clippy::ptr_offset_with_cast,
+    clippy::too_many_arguments,
+    clippy::upper_case_acronyms,
+    clippy::useless_transmute
 )]
 mod ffi {
     include!(concat!(env!("OUT_DIR"), "/calendar.rs"));

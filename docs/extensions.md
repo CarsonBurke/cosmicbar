@@ -150,8 +150,9 @@ It looks for `$XDG_RUNTIME_DIR/mlqueue/mlqd.sock`, falling back to
 `~/.local/state/mlqueue/runtime/mlqd.sock` when `XDG_STATE_HOME` is unset).
 No queue polling or external interpreter is involved.
 
-The cell shows the longest-running job and its elapsed time; an idle queue
-hides it. The popup's header counts running, queued and held jobs over the slot use
+The cell shows the longest-running job and its elapsed time, or with nothing
+running what is left (`2 queued`, `1 held`, `1 lost`); an empty queue hides
+it. The popup's header counts running, queued and held jobs over the slot use
 or the reason nothing starts (paused, admission blocked), beside a pinned
 pause/resume button. Under it, sections list:
 

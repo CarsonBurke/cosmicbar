@@ -373,6 +373,9 @@ struct Extension {
     /// The job whose cancel was pressed once, and when. The second press within
     /// [`ARM_WINDOW`] cancels it: a training run is one misclick from gone.
     armed: Option<(i64, Instant)>,
+    /// The last button sent to the daemon, and when: a double-click on a
+    /// release or retry must not send it twice and report the second's error.
+    pressed: Option<(String, Instant)>,
     last: String,
 }
 
@@ -420,8 +423,16 @@ impl Extension {
             {
                 None
             }
+            _ if self
+                .pressed
+                .as_ref()
+                .is_some_and(|(last, at)| *last == action && at.elapsed() < CONFIRM_DELAY) =>
+            {
+                None
+            }
             _ => {
                 self.armed = None;
+                self.pressed = Some((action.clone(), Instant::now()));
                 Some(action)
             }
         }
@@ -448,18 +459,22 @@ impl Extension {
 
     fn cell(&self, status: &Value, now: i64) -> Value {
         let mut active = 0;
-        let mut pending = 0;
+        let (mut lost, mut pending, mut held) = (0, 0, 0);
         let mut headline = None;
         for job in live(status) {
-            if matches!(job["state"].as_str(), Some("running" | "starting")) {
-                active += 1;
-                // Keep the first job on a tie, as the original extension did.
-                if headline.is_none_or(|old| self.elapsed_ms(job, now) > self.elapsed_ms(old, now))
-                {
-                    headline = Some(job);
+            match job["state"].as_str() {
+                Some("running" | "starting") => {
+                    active += 1;
+                    // Keep the first job on a tie, as the original extension did.
+                    if headline
+                        .is_none_or(|old| self.elapsed_ms(job, now) > self.elapsed_ms(old, now))
+                    {
+                        headline = Some(job);
+                    }
                 }
-            } else {
-                pending += 1;
+                Some("needs_attention") => lost += 1,
+                Some("held") => held += 1,
+                _ => pending += 1,
             }
         }
         let paused = status["paused"].as_bool().unwrap_or(false);
@@ -470,12 +485,18 @@ impl Extension {
             }
             text.push_str(&format!(" · {}", duration(self.elapsed_ms(job, now))));
             json!({"glyph": ICON, "text": text, "color": if self.connected { "green" } else { "muted" }})
+        } else if lost > 0 {
+            // The same words as the popup's header, loudest first: a lost run
+            // wants `mlq recover`, a held one only waits to be released.
+            json!({"glyph": ICON, "text": format!("{lost} lost"), "color": "peach"})
         } else if pending > 0 {
             json!({
                 "glyph": ICON,
                 "text": format!("{pending} {}", if paused { "paused" } else { "queued" }),
                 "color": if paused { "peach" } else { "yellow" },
             })
+        } else if held > 0 {
+            json!({"glyph": ICON, "text": format!("{held} held"), "color": "muted"})
         } else {
             Value::Null
         }
@@ -1009,6 +1030,44 @@ mod tests {
         extension.press("cancel:5".into());
         assert_eq!(extension.press("pause".into()).as_deref(), Some("pause"));
         assert_eq!(extension.press("cancel:5".into()), None);
+    }
+
+    #[test]
+    fn a_double_click_sends_a_verb_once() {
+        let mut extension = Extension::default();
+        assert_eq!(
+            extension.press("release:5".into()).as_deref(),
+            Some("release:5")
+        );
+        assert_eq!(extension.press("release:5".into()), None);
+        // Another job's button is a different decision, not a repeat.
+        assert_eq!(
+            extension.press("release:6".into()).as_deref(),
+            Some("release:6")
+        );
+        extension.pressed = Instant::now()
+            .checked_sub(CONFIRM_DELAY)
+            .map(|at| ("release:6".into(), at));
+        assert_eq!(
+            extension.press("release:6".into()).as_deref(),
+            Some("release:6")
+        );
+    }
+
+    #[test]
+    fn an_idle_cell_uses_the_headers_words() {
+        let cell = |jobs: Value| {
+            Extension::default().cell(&json!({"jobs": jobs}), now_ms())["text"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        let held = json!({"id": 1, "state": "held"});
+        let queued = json!({"id": 2, "state": "queued"});
+        let lost = json!({"id": 3, "state": "needs_attention"});
+        assert_eq!(cell(json!([held])).as_deref(), Some("1 held"));
+        assert_eq!(cell(json!([held, queued])).as_deref(), Some("1 queued"));
+        assert_eq!(cell(json!([held, queued, lost])).as_deref(), Some("1 lost"));
+        assert_eq!(cell(json!([])), None);
     }
 
     #[test]

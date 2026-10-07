@@ -224,7 +224,10 @@ impl State {
                 })
             }
             Event::Terminal(terminal) => Task::batch([
-                mutate("".into(), async move { spawn(&terminal, "bluetoothctl").await }),
+                mutate(
+                    "".into(),
+                    async move { spawn(&terminal, "bluetoothctl").await },
+                ),
                 Task::done(cosmic::Action::App(Message::ClosePopup)),
             ]),
             Event::Done { subject, result } => {
@@ -292,7 +295,11 @@ impl State {
     /// Mirrors `popup`'s own test, so the bar can ask which cells are
     /// clickable without building any popup's contents.
     pub fn has_popup(&self) -> bool {
-        self.available && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.adapter.is_some())
+        self.available
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.adapter.is_some())
     }
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
@@ -656,11 +663,24 @@ fn events(open: &bool) -> impl Stream<Item = Message> + use<> {
 /// owner, so the tree is read again from scratch. `detailed` means the popup is
 /// on screen; with it shut, only changes the cell can draw are emitted.
 async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result<()> {
-    let conn = connection().await?;
+    session_on(sender, detailed, connection().await?).await
+}
 
+async fn session_on(
+    sender: &mut Sender<Message>,
+    detailed: bool,
+    conn: Connection,
+) -> anyhow::Result<()> {
     // Subscribed before the ownership check, so a bluetoothd that starts
     // during the check is not missed.
-    let mut owner = signals(&conn, DBUS, Some(DBUS), Some("NameOwnerChanged"), Some(BLUEZ)).await?;
+    let mut owner = signals(
+        &conn,
+        DBUS,
+        Some(DBUS),
+        Some("NameOwnerChanged"),
+        Some(BLUEZ),
+    )
+    .await?;
     if !has_owner(&conn, BLUEZ).await? {
         let _ = sender.send(event_message(Event::Unavailable)).await;
         log::debug!("bluetooth: waiting for {BLUEZ} on the bus");
@@ -697,15 +717,19 @@ async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result
     }
 
     let mut dirty = false;
+    let mut deadline = None;
     loop {
         // With work pending the loop waits only for the coalescing window, so
         // a discovery burst becomes one snapshot rather than dozens.
         let message = if dirty {
-            match tokio::time::timeout(COALESCE, signals.next()).await {
+            match next_before_deadline(&mut signals, deadline.expect("dirty change has a deadline"))
+                .await
+            {
                 Ok(Some(message)) => message,
                 Ok(None) => return Ok(()),
                 Err(_) => {
                     dirty = false;
+                    deadline = None;
                     snapshot.sort();
                     // With the popup shut the cell is the whole module, and at
                     // rest most patches land on the same glyph, name and
@@ -745,6 +769,20 @@ async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result
             // BlueZ restarted: every object path we hold is stale.
             Change::Restart => return Ok(()),
         }
+        if dirty && deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + COALESCE);
+        }
+    }
+}
+
+async fn next_before_deadline<S: Stream + Unpin>(
+    signals: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<Option<S::Item>, ()> {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(()),
+        message = signals.next() => Ok(message),
     }
 }
 
@@ -769,7 +807,11 @@ enum Change {
 /// counts connected devices, names the single one and prints the worst battery
 /// among them. Everything about an idle device is a popup row.
 fn device_change(connected: bool) -> Change {
-    if connected { Change::Patch } else { Change::Detail }
+    if connected {
+        Change::Patch
+    } else {
+        Change::Detail
+    }
 }
 
 /// Apply one signal to the tree, and report how far the change reached.
@@ -779,10 +821,10 @@ fn apply(message: &BusMessage, snapshot: &mut Snapshot) -> Change {
     match member {
         "NameOwnerChanged" => Change::Restart,
         "InterfacesAdded" => {
-            let Ok((path, interfaces)) = message
-                .body()
-                .deserialize::<(OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>)>()
-            else {
+            let Ok((path, interfaces)) = message.body().deserialize::<(
+                OwnedObjectPath,
+                HashMap<String, HashMap<String, OwnedValue>>,
+            )>() else {
                 return Change::Ignore;
             };
             let path = path.as_str().to_owned();
@@ -816,21 +858,21 @@ fn apply(message: &BusMessage, snapshot: &mut Snapshot) -> Change {
                     }
                     IF_BATTERY => {
                         if let Some(device) = snapshot.device_mut(path)
-                            && device.battery.take().is_some() {
-                                change = change.max(device_change(device.connected));
-                            }
+                            && device.battery.take().is_some()
+                        {
+                            change = change.max(device_change(device.connected));
+                        }
                     }
-                    IF_ADAPTER => {
+                    IF_ADAPTER
                         if snapshot
                             .adapter
                             .as_ref()
-                            .is_some_and(|adapter| adapter.path == path)
-                        {
-                            snapshot.adapter = None;
-                            snapshot.devices.clear();
-                            // The module goes away with its adapter.
-                            change = Change::Patch;
-                        }
+                            .is_some_and(|adapter| adapter.path == path) =>
+                    {
+                        snapshot.adapter = None;
+                        snapshot.devices.clear();
+                        // The module goes away with its adapter.
+                        change = Change::Patch;
                     }
                     _ => {}
                 }
@@ -838,9 +880,10 @@ fn apply(message: &BusMessage, snapshot: &mut Snapshot) -> Change {
             change
         }
         "PropertiesChanged" => {
-            let Ok((interface, changed, _invalidated)) = message
-                .body()
-                .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+            let Ok((interface, changed, _invalidated)) =
+                message
+                    .body()
+                    .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
             else {
                 return Change::Ignore;
             };
@@ -879,7 +922,11 @@ fn merge(
                 path: path.to_owned(),
                 ..Adapter::default()
             });
-            let mut change = if created { Change::Patch } else { Change::Ignore };
+            let mut change = if created {
+                Change::Patch
+            } else {
+                Change::Ignore
+            };
             if let Some(powered) = bool_of(props, "Powered") {
                 if adapter.powered != powered {
                     change = Change::Patch;
@@ -923,7 +970,11 @@ fn merge(
             };
             // A device the bar has not seen before is a popup row until it is
             // connected, which the `Connected` fold below catches.
-            let mut change = if is_new { Change::Detail } else { Change::Ignore };
+            let mut change = if is_new {
+                Change::Detail
+            } else {
+                Change::Ignore
+            };
             if let Some(connected) = bool_of(props, "Connected") {
                 if device.connected != connected {
                     // The glyph, the count, the name and the battery all follow
@@ -1089,12 +1140,19 @@ fn new_owner(message: &BusMessage) -> Option<String> {
 /// session when the client that started it disconnects, so the connection that
 /// calls `StartDiscovery` has to outlive the click.
 async fn connection() -> anyhow::Result<Connection> {
-    static CONNECTION: tokio::sync::OnceCell<Connection> = tokio::sync::OnceCell::const_new();
-    CONNECTION
-        .get_or_try_init(Connection::system)
-        .await
-        .cloned()
-        .context("connecting to the system bus")
+    static CONNECTION: tokio::sync::Mutex<Option<Connection>> = tokio::sync::Mutex::const_new(None);
+    let mut slot = CONNECTION.lock().await;
+    reuse_or_connect(&mut slot, Connection::system()).await
+}
+
+async fn reuse_or_connect(
+    slot: &mut Option<Connection>,
+    connect: impl std::future::Future<Output = zbus::Result<Connection>>,
+) -> anyhow::Result<Connection> {
+    if slot.as_ref().is_none_or(Connection::is_closed) {
+        *slot = Some(connect.await.context("connecting to the system bus")?);
+    }
+    Ok(slot.as_ref().expect("connection initialized").clone())
 }
 
 async fn has_owner(conn: &Connection, name: &str) -> anyhow::Result<bool> {
@@ -1189,4 +1247,126 @@ fn i16_of(props: &HashMap<String, OwnedValue>, key: &str) -> Option<i16> {
     }
 }
 
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
 
+    #[tokio::test]
+    async fn an_always_ready_signal_backlog_cannot_overrun_the_deadline() {
+        let mut signals = futures::stream::repeat(());
+        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert!(next_before_deadline(&mut signals, expired).await.is_err());
+    }
+
+    struct BluezTree;
+
+    #[zbus::interface(name = "org.freedesktop.DBus.ObjectManager")]
+    impl BluezTree {
+        fn get_managed_objects(
+            &self,
+        ) -> HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>> {
+            HashMap::from([(
+                OwnedObjectPath::try_from("/org/bluez/hci0").unwrap(),
+                HashMap::from([(
+                    IF_ADAPTER.into(),
+                    HashMap::from([("Powered".into(), OwnedValue::from(true))]),
+                )]),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_discovery_signals_do_not_starve_popup_updates() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut daemon = tokio::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .await
+            .unwrap();
+        let service = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(BLUEZ)
+            .unwrap()
+            .serve_at("/", BluezTree)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (mut sender, mut receiver) = cosmic::iced::futures::channel::mpsc::channel(8);
+        let worker = tokio::spawn(async move { session_on(&mut sender, true, client).await });
+        assert!(matches!(
+            receiver.next().await,
+            Some(Message::Module(ModuleEvent::Bluetooth(Event::Snapshot(_))))
+        ));
+        let flood = tokio::spawn(async move {
+            for count in 0..60 {
+                let changed =
+                    HashMap::from([("Powered".to_string(), OwnedValue::from(count % 2 == 0))]);
+                service
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/bluez/hci0",
+                        IF_PROPERTIES,
+                        "PropertiesChanged",
+                        &(IF_ADAPTER, changed, Vec::<String>::new()),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let update = tokio::time::timeout(Duration::from_millis(400), receiver.next()).await;
+        flood.abort();
+        worker.abort();
+        assert!(matches!(
+            update,
+            Ok(Some(Message::Module(ModuleEvent::Bluetooth(
+                Event::Snapshot(_)
+            ))))
+        ));
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_closed_cached_bus_connection_is_replaced() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut daemon = tokio::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .await
+            .unwrap();
+        let open = || async {
+            zbus::connection::Builder::address(address.trim())?
+                .build()
+                .await
+        };
+        let original = open().await.unwrap();
+        let mut slot = Some(original.clone());
+        original.close().await.unwrap();
+        let replacement = reuse_or_connect(&mut slot, open()).await.unwrap();
+        assert!(!replacement.is_closed());
+        let proxy = zbus::fdo::DBusProxy::new(&replacement).await.unwrap();
+        assert!(!proxy.list_names().await.unwrap().is_empty());
+        replacement.close().await.unwrap();
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}

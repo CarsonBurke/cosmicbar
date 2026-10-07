@@ -106,7 +106,9 @@ pub enum Event {
     CheckNow,
     /// Popup: open the upgrade in a terminal. The terminal comes from `Ctx`,
     /// which only the view side has, so the event carries it.
-    Upgrade { terminal: String },
+    Upgrade {
+        terminal: String,
+    },
     /// The upgrade terminal could not be started.
     SpawnFailed(String),
 }
@@ -164,16 +166,7 @@ impl State {
         // notification and a keypress so the log stays readable. Reproducing
         // that needs one command line for the terminal to run; it is a launch,
         // not a data source.
-        let mut script = String::from("sudo pacman -Syu");
-        if let Some(helper) = helper {
-            script.push_str("; ");
-            script.push_str(helper);
-            script.push_str(" -Syu");
-        }
-        script.push_str(
-            "; notify-send 'Update Complete' -i package-install; \
-             printf '\\nPress enter to exit...'; read -r _",
-        );
+        let script = upgrade_script(helper);
         Task::future(async move {
             let spawned = tokio::process::Command::new(&terminal)
                 .arg("-e")
@@ -384,9 +377,7 @@ fn local_db_mtime() -> Option<SystemTime> {
 /// One full check: repository updates, plus AUR updates when a helper exists.
 async fn check() -> Report {
     let checked_ms = jiff::Timestamp::now().as_millisecond();
-    let helper = HELPERS
-        .into_iter()
-        .find(|helper| which(helper).is_some());
+    let helper = HELPERS.into_iter().find(|helper| which(helper).is_some());
 
     let repo = match repo_updates().await {
         Ok(repo) => repo,
@@ -411,7 +402,7 @@ async fn check() -> Report {
             // A helper with nothing to report exits non-zero and says nothing;
             // that is not a failure.
             Ok(output) => report.aur = parse(&output),
-            Err(error) => log::debug!("{helper} -Qua: {error}"),
+            Err(error) => report.error = Some(format!("AUR check failed: {error}")),
         }
     }
     report
@@ -426,9 +417,8 @@ async fn repo_updates() -> Result<Vec<Update>, String> {
     run("pacman", &["-Qu"]).await.map(|output| parse(&output))
 }
 
-/// Run one command and take stdout. `checkupdates` exits 2 with no output when
-/// there is nothing to do, and `pacman -Qu` exits 1 in the same case, so an
-/// empty stdout is success no matter what the status was.
+/// Run one command and take stdout, recognizing only documented no-update
+/// statuses rather than treating arbitrary failures as an up-to-date system.
 async fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let child = tokio::process::Command::new(program)
         .args(args)
@@ -445,15 +435,42 @@ async fn run(program: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|_| format!("{program} timed out"))?
         .map_err(|error| format!("{program}: {error}"))?;
 
+    command_output(program, output)
+}
+
+fn command_output(program: &str, output: std::process::Output) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() && stdout.trim().is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if !stderr.is_empty() {
-            return Err(format!("{program}: {stderr}"));
-        }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let no_updates = stdout.trim().is_empty()
+        && stderr.trim().is_empty()
+        && output.status.code() == Some(if program == "checkupdates" { 2 } else { 1 });
+    if !output.status.success() && !no_updates {
+        let reason = if stderr.trim().is_empty() {
+            output.status.to_string()
+        } else {
+            stderr.trim().to_owned()
+        };
+        return Err(format!("{program}: {reason}"));
     }
     Ok(stdout)
+}
+
+/// Preserve the failing package manager's status before notification commands
+/// can replace it. An official update must succeed before an AUR update starts.
+fn upgrade_script(helper: Option<&str>) -> String {
+    let command = helper.map_or_else(
+        || "sudo pacman -Syu".to_owned(),
+        |helper| format!("sudo pacman -Syu && {helper} -Syu"),
+    );
+    format!(
+        "{command}; cosmicbar_upgrade_status=$?; \
+         if [ \"$cosmicbar_upgrade_status\" -eq 0 ]; then \
+           notify-send 'Update Complete' -i package-install; \
+         else \
+           notify-send -u critical 'Update Failed' 'See the terminal for details' -i package-install; \
+         fi; printf '\\nPress enter to exit...'; read -r _; \
+         exit \"$cosmicbar_upgrade_status\""
+    )
 }
 
 /// `pkgname 1.0-1 -> 1.1-1`, the format shared by `checkupdates`, `pacman -Qu`
@@ -482,4 +499,84 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(program))
         .find(|candidate| Path::new(candidate).is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn package_queries_distinguish_no_updates_from_failed_and_partial_checks() {
+        assert!(command_output("checkupdates", output(2, "", "")).is_ok());
+        assert!(command_output("pacman", output(1, "", "")).is_ok());
+        assert!(command_output("paru", output(1, "", "")).is_ok());
+        assert!(command_output("checkupdates", output(1, "", "")).is_err());
+        assert!(command_output("paru", output(2, "", "")).is_err());
+        assert!(command_output("paru", output(1, "pkg 1 -> 2\n", "query failed")).is_err());
+        assert!(command_output("paru", output(1, "", "network down")).is_err());
+        assert_eq!(
+            command_output("checkupdates", output(0, "pkg 1 -> 2\n", "")).unwrap(),
+            "pkg 1 -> 2\n"
+        );
+    }
+
+    fn run_upgrade(
+        repo_status: i32,
+        aur_status: i32,
+        helper: Option<&str>,
+    ) -> std::process::Output {
+        // Shell functions intercept every real command: this exercises the exact
+        // generated shell without privileges, package changes, or notifications.
+        let mocks = format!(
+            "sudo() {{ printf 'repo\\n'; return {repo_status}; }}; \
+             paru() {{ printf 'aur\\n'; return {aur_status}; }}; \
+             notify-send() {{ printf 'notification:%s\\n' \"$*\"; }}; "
+        );
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(mocks + &upgrade_script(helper))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn failed_official_upgrade_skips_aur_and_never_announces_success() {
+        let output = run_upgrade(1, 0, Some("paru"));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!stdout.lines().any(|line| line == "aur"));
+        assert!(stdout.contains("Update Failed"));
+        assert!(!stdout.contains("Update Complete"));
+    }
+
+    #[test]
+    fn failed_aur_upgrade_preserves_failure_status_and_notification() {
+        let output = run_upgrade(0, 3, Some("paru"));
+        assert_eq!(output.status.code(), Some(3));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.lines().any(|line| line == "aur"));
+        assert!(stdout.contains("Update Failed"));
+        assert!(!stdout.contains("Update Complete"));
+    }
+
+    #[test]
+    fn successful_upgrades_announce_completion_with_or_without_an_aur_helper() {
+        for helper in [None, Some("paru")] {
+            let output = run_upgrade(0, 0, helper);
+            assert!(output.status.success());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("Update Complete"));
+            assert!(!stdout.contains("Update Failed"));
+        }
+    }
 }

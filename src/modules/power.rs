@@ -3,7 +3,7 @@
 //!
 //! Everything goes through logind on D-Bus instead of `systemctl`/`loginctl`,
 //! and log out goes through niri's IPC. Choosing an available action executes
-//! it directly; the menu itself is the deliberate interaction boundary.
+//! it directly, except session-ending actions which ask for confirmation.
 //!
 //! logind exposes no signal for `CanPowerOff`/`CanHibernate`, so capabilities
 //! are queried while the popup is open (see [`State::subscription`]) and
@@ -53,6 +53,10 @@ impl Action {
         Self::PowerOff,
     ];
 
+    fn needs_confirmation(self) -> bool {
+        matches!(self, Self::LogOut | Self::Reboot | Self::PowerOff)
+    }
+
     fn glyph(self) -> &'static str {
         match self {
             // nf-md-lock, nf-md-logout, nf-md-sleep, nf-md-snowflake,
@@ -76,7 +80,6 @@ impl Action {
             Self::PowerOff => "Power off",
         }
     }
-
 }
 
 /// logind's `Can*` answer.
@@ -135,6 +138,9 @@ pub struct Capabilities {
 pub enum Event {
     Capabilities(Capabilities),
     Fire(Action),
+    Confirm,
+    Cancel,
+    Dismiss,
     Done(Result<(), String>),
 }
 
@@ -142,6 +148,7 @@ pub enum Event {
 pub struct State {
     capabilities: Capabilities,
     error: Option<String>,
+    confirmation: Option<Action>,
 }
 
 impl State {
@@ -162,20 +169,20 @@ impl State {
                 Task::none()
             }
             Event::Fire(action) => {
-                self.error = None;
-                let interactive = self.capability(action).interactive();
-                Task::batch([
-                    // Leaving the menu open over a suspend or a shutdown would
-                    // be wrong; the action is decided, so the popup goes away.
-                    Task::done(cosmic::Action::App(Message::ClosePopup)),
-                    Task::future(async move {
-                        cosmic::Action::App(event_message(Event::Done(
-                            fire(action, interactive)
-                                .await
-                                .map_err(|error| format!("{error:#}")),
-                        )))
-                    }),
-                ])
+                if action.needs_confirmation() {
+                    self.confirmation = Some(action);
+                    self.error = None;
+                    return Task::none();
+                }
+                self.execute(action)
+            }
+            Event::Confirm => match self.confirmation.take() {
+                Some(action) => self.execute(action),
+                None => Task::none(),
+            },
+            Event::Cancel | Event::Dismiss => {
+                self.confirmation = None;
+                Task::none()
             }
             Event::Done(result) => {
                 if let Err(error) = &result {
@@ -185,6 +192,28 @@ impl State {
                 Task::none()
             }
         }
+    }
+
+    fn execute(&mut self, action: Action) -> Task<Message> {
+        self.confirmation = None;
+        if !self.capability(action).usable() {
+            self.error = Some(format!("{} is no longer available", action.label()));
+            return Task::none();
+        }
+        self.error = None;
+        let interactive = self.capability(action).interactive();
+        Task::batch([
+            // Leaving the menu open over a suspend or a shutdown would
+            // be wrong; the action is decided, so the popup goes away.
+            Task::done(cosmic::Action::App(Message::ClosePopup)),
+            Task::future(async move {
+                cosmic::Action::App(event_message(Event::Done(
+                    fire(action, interactive)
+                        .await
+                        .map_err(|error| format!("{error:#}")),
+                )))
+            }),
+        ])
     }
 
     pub fn view(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
@@ -209,6 +238,31 @@ impl State {
 
     pub fn popup(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
         let palette = ctx.palette;
+        if let Some(action) = self.confirmation {
+            return Some(
+                Card::new()
+                    .block(popup::title(format!("{}?", action.label()), ctx))
+                    .block(popup::detail(
+                        "Save your work before ending the session.",
+                        ctx,
+                    ))
+                    .block(popup::actions([
+                        popup::chip(
+                            "Cancel",
+                            popup::Chip::Plain,
+                            ctx,
+                            Some(event_message(Event::Cancel)),
+                        ),
+                        popup::chip(
+                            action.label(),
+                            popup::Chip::Danger,
+                            ctx,
+                            Some(event_message(Event::Confirm)),
+                        ),
+                    ]))
+                    .build(),
+            );
+        }
         let mut menu = popup::column();
 
         for action in Action::MENU {
@@ -263,7 +317,6 @@ impl State {
             Action::Lock | Action::LogOut => Capability::Unknown,
         }
     }
-
 }
 
 fn event_message(event: Event) -> Message {
@@ -425,4 +478,31 @@ trait Login1Session {
     fn id(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn locked_hint(&self) -> zbus::Result<bool>;
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn dismissing_confirmation_returns_to_the_action_menu() {
+        let mut modules = crate::modules::Modules::default();
+        let _ = modules.power.update(Event::Fire(Action::PowerOff));
+        assert!(modules.power.confirmation.is_some());
+        modules.set_popup(None);
+        assert!(modules.power.confirmation.is_none());
+    }
+
+    #[test]
+    fn session_ending_actions_require_a_separate_confirmation() {
+        for action in [Action::LogOut, Action::Reboot, Action::PowerOff] {
+            let mut state = State::default();
+            let _ = state.update(Event::Fire(action));
+            assert_eq!(state.confirmation, Some(action));
+            let _ = state.update(Event::Cancel);
+            assert_eq!(state.confirmation, None);
+        }
+        assert!(!Action::Lock.needs_confirmation());
+        assert!(!Action::Suspend.needs_confirmation());
+    }
 }

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use crate::tracked::{Tracker, Update as RectangleUpdate};
 use cosmic::app::{Core, Task};
 use cosmic::cctk::sctk::reexports::client::protocol::wl_output::WlOutput;
 use cosmic::cctk::sctk::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
@@ -20,7 +21,6 @@ use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
 use cosmic::iced::runtime::platform_specific::wayland::popup::{SctkPopupSettings, SctkPositioner};
 use cosmic::iced::window::Id as SurfaceId;
 use cosmic::iced::{Alignment, Length, Limits, Rectangle, Subscription};
-use cosmic::widget::rectangle_tracker::{RectangleTracker, RectangleUpdate};
 use cosmic::widget::{self, autosize};
 use cosmic::{Apply, Element};
 
@@ -41,7 +41,7 @@ pub enum Message {
     /// An output appeared (or its info changed): place a bar on it.
     OutputReady(WlOutput, Option<String>),
     OutputRemoved(WlOutput),
-    Rect(RectangleUpdate<TrackedRect>),
+    Rect(RectangleUpdate),
     /// A module was clicked on a particular bar surface.
     Toggle(SurfaceId, ModuleId),
     /// The compositor told a bar surface how wide it is. Modules that can grow
@@ -75,7 +75,7 @@ impl Message {
             Self::OutputRemoved(_) => "OutputRemoved".into(),
             Self::Sized(_, width) => format!("Sized({width})"),
             Self::Rect(RectangleUpdate::Init(_)) => "Rect(Init)".into(),
-            Self::Rect(RectangleUpdate::Rectangle(((_, id), rect))) => {
+            Self::Rect(RectangleUpdate::Rectangle(((_, id), Some(rect)))) => {
                 format!(
                     "Rect({} @ {},{} {}x{})",
                     id.name(),
@@ -84,6 +84,9 @@ impl Message {
                     rect.width,
                     rect.height
                 )
+            }
+            Self::Rect(RectangleUpdate::Rectangle(((_, id), None))) => {
+                format!("Rect({} hidden)", id.name())
             }
             Self::Toggle(_, id) => format!("Toggle({})", id.name()),
             Self::ClosePopup => "ClosePopup".into(),
@@ -120,9 +123,12 @@ pub struct Bar {
     now: jiff::Zoned,
     config: Config,
     modules: Modules,
+    /// Every connected output, including outputs excluded by configuration.
+    /// Surface placement must not be the source of truth for output discovery.
+    outputs: Vec<(WlOutput, Option<String>)>,
     bars: Vec<BarSurface>,
     popup: Option<Popup>,
-    tracker: Option<RectangleTracker<TrackedRect>>,
+    tracker: Option<Tracker>,
     rects: HashMap<TrackedRect, Rectangle>,
 }
 
@@ -141,6 +147,7 @@ impl cosmic::Application for Bar {
                 now: jiff::Zoned::now(),
                 config,
                 modules,
+                outputs: Vec::new(),
                 bars: Vec::new(),
                 popup: None,
                 tracker: None,
@@ -161,14 +168,21 @@ impl cosmic::Application for Bar {
     fn update(&mut self, message: Message) -> Task<Message> {
         log::debug!("update {}", message.label());
         let task = match message {
-            Message::OutputReady(output, name) => self.add_bar(output, name),
-            Message::OutputRemoved(output) => self.remove_bar(&output),
+            Message::OutputReady(output, name) => self.output_ready(output, name),
+            Message::OutputRemoved(output) => {
+                self.outputs.retain(|(known, _)| *known != output);
+                self.remove_bar(&output)
+            }
             Message::Rect(RectangleUpdate::Init(tracker)) => {
                 self.tracker = Some(tracker);
                 Task::none()
             }
             Message::Rect(RectangleUpdate::Rectangle((key, rect))) => {
-                self.rects.insert(key, rect);
+                if let Some(rect) = rect {
+                    self.rects.insert(key, rect);
+                } else {
+                    self.rects.remove(&key);
+                }
                 Task::none()
             }
             Message::Toggle(parent, module) => self.toggle_popup(parent, module, true),
@@ -251,10 +265,7 @@ impl cosmic::Application for Bar {
         subscriptions.push(crate::control::subscription());
         subscriptions.push(Config::watch());
 
-        subscriptions.push(
-            cosmic::widget::rectangle_tracker::subscription::<_, TrackedRect>("cosmicbar")
-                .map(|(_, update)| Message::Rect(update)),
-        );
+        subscriptions.push(crate::tracked::subscription());
 
         subscriptions.push(listen_with(|event, _status, id| match event {
             // A layer surface learns its width from the compositor's configure,
@@ -312,6 +323,24 @@ impl cosmic::Application for Bar {
 }
 
 impl Bar {
+    fn output_ready(&mut self, output: WlOutput, name: Option<String>) -> Task<Message> {
+        let name = if let Some((_, known_name)) =
+            self.outputs.iter_mut().find(|(known, _)| *known == output)
+        {
+            if name.is_some() {
+                *known_name = name;
+            }
+            known_name.clone()
+        } else {
+            self.outputs.push((output.clone(), name.clone()));
+            name
+        };
+        if !self.config.wants_output(name.as_deref()) {
+            return self.remove_bar(&output);
+        }
+        self.add_bar(output, name)
+    }
+
     fn ctx_for(&self, surface: Option<SurfaceId>) -> Ctx {
         let output = surface
             .or_else(|| self.popup.as_ref().map(|popup| popup.parent))
@@ -348,13 +377,8 @@ impl Bar {
             }
             return Task::none();
         }
-        if !self.config.outputs.is_empty() {
-            let wanted = name
-                .as_deref()
-                .is_some_and(|name| self.config.outputs.iter().any(|want| want == name));
-            if !wanted {
-                return Task::none();
-            }
+        if !self.config.wants_output(name.as_deref()) {
+            return Task::none();
         }
 
         let surface = SurfaceId::unique();
@@ -410,13 +434,20 @@ impl Bar {
     }
 
     /// Re-read the config file. Layout, palette and height are picked up live;
-    /// a bar surface only has to be rebuilt when its output set or height
+    /// a bar surface only has to be rebuilt when its output set, layer or height
     /// changed, and a popup for a module that is no longer placed is dropped.
     fn reload(&mut self) -> Task<Message> {
         let previous = std::mem::replace(&mut self.config, Config::load());
+        crate::theme::set_font(crate::theme::font(self.config.font_weight_bold));
+        crate::theme::set_icon_font(crate::theme::icon_font(self.config.font_weight_bold));
         self.modules.sync_extensions(&self.config);
         // The brightness modes file is edited by hand as well as by the popup.
-        let mut tasks = vec![modules::brightness::State::load_modes()];
+        let mut tasks = vec![
+            modules::brightness::State::load_modes(),
+            self.modules
+                .brightness
+                .update(modules::brightness::Event::Rediscover),
+        ];
 
         if self
             .popup
@@ -426,12 +457,11 @@ impl Bar {
             tasks.push(self.close_popup());
         }
 
-        if previous.height != self.config.height || previous.outputs != self.config.outputs {
-            let outputs: Vec<(WlOutput, Option<String>)> = self
-                .bars
-                .iter()
-                .map(|bar| (bar.output.clone(), bar.name.clone()))
-                .collect();
+        if previous.height != self.config.height
+            || previous.outputs != self.config.outputs
+            || previous.overlay_layer != self.config.overlay_layer
+        {
+            let outputs = self.outputs.clone();
             for (output, _) in &outputs {
                 tasks.push(self.remove_bar(output));
             }
@@ -551,33 +581,20 @@ impl Bar {
         let ctx = self.ctx_for(Some(surface));
         let height = Length::Fixed(self.config.height as f32);
 
-        let edges = widget::Row::new()
-            .push(self.region(surface, &self.config.left, &ctx))
-            .push(widget::space::horizontal())
-            .push(self.region(surface, &self.config.right, &ctx))
-            .width(Length::Fill)
-            .height(height)
-            .align_y(Alignment::Center);
-
-        let center = self
-            .region(surface, &self.config.center, &ctx)
-            .apply(widget::container)
-            .width(Length::Fill)
-            .height(height)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center);
-
         crate::hover::guard(
-            cosmic::iced::widget::Stack::new()
-                .push(edges)
-                .push(center)
-                .width(Length::Fill)
-                .height(height)
-                .apply(widget::container)
-                .class(crate::theme::bar(ctx.palette))
-                .padding([0.0, 8.0])
-                .width(Length::Fill)
-                .height(height),
+            crate::regions::regions(
+                [
+                    self.region(surface, &self.config.left, &ctx),
+                    self.region(surface, &self.config.center, &ctx),
+                    self.region(surface, &self.config.right, &ctx),
+                ],
+                self.config.height as f32,
+            )
+            .apply(widget::container)
+            .class(crate::theme::bar(ctx.palette))
+            .padding([0.0, 8.0])
+            .width(Length::Fill)
+            .height(height),
         )
     }
 
@@ -720,29 +737,12 @@ impl Bar {
                     .wrap(),
                 None => cell,
             };
-            // The tracker container forwards `state()` to whatever it wraps but
-            // leaves `tag()` at the default *stateless* tag, so iced sees every
-            // tracked cell as the same kind of node and happily reuses one
-            // module's state for another module's widget the moment a cell
-            // appears, vanishes or shifts along the row — a downcast panic one
-            // frame later. A single-child `Row` inside the tracker keeps that
-            // node genuinely stateless: reuse then only re-diffs the child,
-            // where the real tags are compared and a mismatch rebuilds.
-            //
+            // Track the visible cell, including its region's scroll translation.
             // Only a cell that can open a popup is tracked: the rectangle is
             // read in exactly one place, to anchor that popup, and the tracker
-            // sends the rect of every cell it wraps down a channel on every
-            // single draw.
+            // reports changed geometry and the geometry behind a click.
             let cell: Element<'a, Message> = match (&self.tracker, clickable) {
-                (Some(tracker), true) => tracker
-                    .container(
-                        (surface, id),
-                        widget::Row::new()
-                            .push(cell)
-                            .height(height)
-                            .align_y(Alignment::Center),
-                    )
-                    .into(),
+                (Some(tracker), true) => tracker.container((surface, id), cell),
                 _ => cell,
             };
             inner = inner.push(cell);

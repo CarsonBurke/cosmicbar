@@ -239,12 +239,10 @@ impl Widget<Message, Theme, Renderer> for FillBox<'_> {
                 }
             }
             // Wherever the release lands, this cell is no longer held.
-            IcedEvent::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.down {
-                    state.down = false;
-                    state.press.go_mut(false, Instant::now());
-                    shell.request_redraw();
-                }
+            IcedEvent::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.down => {
+                state.down = false;
+                state.press.go_mut(false, Instant::now());
+                shell.request_redraw();
             }
             _ => {}
         }

@@ -148,7 +148,10 @@ pub enum Event {
     /// NetworkManager is gone or unreachable; the subscriber is retrying.
     Unavailable,
     /// One `/sys` sample pair, in bytes per second.
-    Rates { rx: f64, tx: f64 },
+    Rates {
+        rx: f64,
+        tx: f64,
+    },
     Activate {
         profile: String,
         device: String,
@@ -670,6 +673,14 @@ impl State {
 }
 
 impl Snapshot {
+    fn is_active_ap(&self, path: &str) -> bool {
+        self.primary
+            .iter()
+            .chain(self.secondary.iter())
+            .filter_map(|active| active.ap.as_ref())
+            .any(|ap| ap.path == path)
+    }
+
     /// Glyph, the rest of the label, and its colour. Split because the bar
     /// draws the two halves as separate text runs: one string would carry a
     /// full mono space between icon and name.
@@ -697,9 +708,7 @@ impl Snapshot {
             if active.state != ACTIVE_ACTIVATED {
                 return (icon, "connecting…", Tier::Pending);
             }
-            if self.connectivity != CONNECTIVITY_FULL
-                && self.connectivity != CONNECTIVITY_UNKNOWN
-            {
+            if self.connectivity != CONNECTIVITY_FULL && self.connectivity != CONNECTIVITY_UNKNOWN {
                 return (ICON_NO_INTERNET, "no internet", Tier::Degraded);
             }
             return (icon, "", Tier::Up);
@@ -762,8 +771,12 @@ impl Snapshot {
 
     /// Strongest first, one row per SSID.
     fn sort_aps(&mut self) {
-        self.aps
-            .sort_by(|a, b| a.ssid.cmp(&b.ssid).then(b.strength.cmp(&a.strength)));
+        self.aps.sort_by(|a, b| {
+            a.ssid
+                .cmp(&b.ssid)
+                .then(b.active.cmp(&a.active))
+                .then(b.strength.cmp(&a.strength))
+        });
         self.aps.dedup_by(|a, b| a.ssid == b.ssid);
         self.aps.sort_by(|a, b| {
             b.active
@@ -784,9 +797,7 @@ fn close_popup() -> Task<Message> {
 }
 
 /// Run a mutation and report its outcome, so a refused call is visible.
-fn mutate(
-    call: impl Future<Output = anyhow::Result<()>> + Send + 'static,
-) -> Task<Message> {
+fn mutate(call: impl Future<Output = anyhow::Result<()>> + Send + 'static) -> Task<Message> {
     Task::future(async move {
         cosmic::Action::App(event_message(Event::Done(
             call.await.map_err(|error| format!("{error:#}")),
@@ -928,11 +939,20 @@ fn events(open: &bool) -> impl Stream<Item = Message> + use<> {
 /// reads the saved profiles or the neighbourhood scan, so this session neither
 /// reads them nor wakes for the signals that only touch them.
 async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result<()> {
-    let bus = Bus::system().await?;
+    session_on(sender, detailed, Bus::system().await?).await
+}
 
+async fn session_on(sender: &mut Sender<Message>, detailed: bool, bus: Bus) -> anyhow::Result<()> {
     // Subscribed before the ownership check, so a NetworkManager that starts
     // during the check is not missed.
-    let owner = signals(&bus.conn, DBUS, Some(DBUS), Some("NameOwnerChanged"), Some(NM)).await?;
+    let owner = signals(
+        &bus.conn,
+        DBUS,
+        Some(DBUS),
+        Some("NameOwnerChanged"),
+        Some(NM),
+    )
+    .await?;
     let mut owner = owner;
     if !bus.has_owner(NM).await? {
         let _ = sender.send(event_message(Event::Unavailable)).await;
@@ -967,11 +987,17 @@ async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result
 
     let mut reread = false;
     let mut dirty = false;
+    let mut deadline = None;
     loop {
         // With work pending, the loop waits only for the coalescing window:
         // a scan's worth of strength updates becomes one snapshot.
         let message = if dirty {
-            match tokio::time::timeout(COALESCE, signals.next()).await {
+            match next_before_deadline(
+                &mut signals,
+                deadline.expect("dirty snapshot has a deadline"),
+            )
+            .await
+            {
                 Ok(Some(message)) => message,
                 Ok(None) => return Ok(()),
                 Err(_) => {
@@ -982,6 +1008,7 @@ async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result
                         snapshot.sort_aps();
                     }
                     dirty = false;
+                    deadline = None;
                     if !publish(sender, &mut drawn, &snapshot, detailed).await {
                         return Ok(());
                     }
@@ -1005,6 +1032,22 @@ async fn session(sender: &mut Sender<Message>, detailed: bool) -> anyhow::Result
             // NetworkManager restarted: every object path we hold is stale.
             Change::Restart => return Ok(()),
         }
+        if dirty && deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + COALESCE);
+        }
+    }
+}
+
+async fn next_before_deadline<S: Stream + Unpin>(
+    signals: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<Option<S::Item>, ()> {
+    // Once the first change's window ends, publish even if the signal queue
+    // never empties. Giving the timer priority also bounds an always-ready burst.
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(()),
+        message = signals.next() => Ok(message),
     }
 }
 
@@ -1075,7 +1118,10 @@ fn classify(message: &BusMessage, snapshot: &mut Snapshot, detailed: bool) -> Ch
             };
             match interface.as_str() {
                 IF_MANAGER => {
-                    if changed.keys().any(|key| MANAGER_KEYS.contains(&key.as_str())) {
+                    if changed
+                        .keys()
+                        .any(|key| MANAGER_KEYS.contains(&key.as_str()))
+                    {
                         Change::Reread
                     } else {
                         Change::Ignore
@@ -1084,7 +1130,10 @@ fn classify(message: &BusMessage, snapshot: &mut Snapshot, detailed: bool) -> Ch
                 IF_ACTIVE | IF_IP4 => Change::Reread,
                 IF_AP => patch_strength(snapshot, path, &changed),
                 interface if interface.starts_with(IF_DEVICE) => {
-                    if changed.keys().any(|key| DEVICE_KEYS.contains(&key.as_str())) {
+                    if changed
+                        .keys()
+                        .any(|key| DEVICE_KEYS.contains(&key.as_str()))
+                    {
                         Change::Reread
                     } else {
                         Change::Ignore
@@ -1123,7 +1172,11 @@ fn patch_strength(
         touched |= link.strength != strength;
         link.strength = strength;
     }
-    if touched { Change::Patch } else { Change::Ignore }
+    if touched {
+        Change::Patch
+    } else {
+        Change::Ignore
+    }
 }
 
 /// A signal stream for one match rule, filtered by the bus.
@@ -1315,9 +1368,10 @@ async fn read_snapshot(bus: &Bus, detailed: bool) -> Snapshot {
             active.state == ACTIVE_ACTIVATING
                 && (active.kind.starts_with("802-11-wireless")
                     || active.kind.starts_with("802-3-ethernet"))
-        }) {
-            snapshot.primary = Some(snapshot.secondary.remove(index));
-        }
+        })
+    {
+        snapshot.primary = Some(snapshot.secondary.remove(index));
+    }
 
     if detailed {
         snapshot.profiles = read_profiles(bus, &snapshot).await;
@@ -1458,12 +1512,6 @@ async fn read_access_points(bus: &Bus, wifi: &Device, snapshot: &Snapshot) -> Ve
             return Vec::new();
         }
     };
-    let active = snapshot
-        .primary
-        .as_ref()
-        .and_then(|active| active.ap.as_ref())
-        .map(|link| link.path.clone());
-
     let mut aps = Vec::with_capacity(paths.len());
     for path in paths {
         let path = path.as_str().to_owned();
@@ -1485,7 +1533,7 @@ async fn read_access_points(bus: &Bus, wifi: &Device, snapshot: &Snapshot) -> Ve
                 u32_of(&props, "RsnFlags").unwrap_or(0),
             ),
             frequency: u32_of(&props, "Frequency").unwrap_or(0),
-            active: active.as_deref() == Some(path.as_str()),
+            active: snapshot.is_active_ap(&path),
             ssid,
             profile,
             path,
@@ -1705,20 +1753,172 @@ fn dicts_of(props: &HashMap<String, OwnedValue>, key: &str) -> Vec<Vec<(String, 
 }
 
 fn dict_string(entry: &[(String, OwnedValue)], key: &str) -> Option<String> {
-    entry.iter().find(|(name, _)| name == key).and_then(|(_, value)| {
-        match peel(value) {
+    entry
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, value)| match peel(value) {
             Value::Str(value) => Some(value.as_str().to_owned()),
             _ => None,
-        }
-    })
+        })
 }
 
 fn dict_u32(entry: &[(String, OwnedValue)], key: &str) -> Option<u32> {
-    entry.iter().find(|(name, _)| name == key).and_then(|(_, value)| {
-        match peel(value) {
+    entry
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, value)| match peel(value) {
             Value::U32(value) => Some(*value),
             Value::I32(value) => u32::try_from(*value).ok(),
             _ => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NetworkManagerFixture(Arc<std::sync::atomic::AtomicU32>);
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager")]
+    impl NetworkManagerFixture {
+        #[zbus(property)]
+        fn state(&self) -> u32 {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
         }
-    })
+    }
+
+    #[tokio::test]
+    async fn an_always_ready_signal_queue_cannot_overrun_its_coalescing_deadline() {
+        let mut signals = futures::stream::repeat(());
+        assert!(
+            next_before_deadline(
+                &mut signals,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sustained_network_changes_publish_before_the_signal_burst_ends() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut daemon = tokio::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .await
+            .unwrap();
+        let state = Arc::new(std::sync::atomic::AtomicU32::new(20));
+        let service = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(NM)
+            .unwrap()
+            .serve_at(NM_PATH, NetworkManagerFixture(state.clone()))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let conn = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (mut sender, mut receiver) = cosmic::iced::futures::channel::mpsc::channel(8);
+        let worker = tokio::spawn(async move { session_on(&mut sender, true, Bus { conn }).await });
+        let initial = tokio::time::timeout(Duration::from_secs(2), receiver.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(initial, Some(Message::Module(ModuleEvent::Network(Event::Snapshot(snapshot)))) if snapshot.state == 20)
+        );
+        let flood = tokio::spawn(async move {
+            for count in 0..60 {
+                let current = if count % 2 == 0 { 60 } else { 70 };
+                state.store(current, std::sync::atomic::Ordering::Release);
+                service
+                    .emit_signal(
+                        None::<&str>,
+                        NM_PATH,
+                        IF_PROPERTIES,
+                        "PropertiesChanged",
+                        &(
+                            IF_MANAGER,
+                            HashMap::from([("State".to_owned(), OwnedValue::from(current))]),
+                            Vec::<String>::new(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let update = tokio::time::timeout(Duration::from_millis(450), receiver.next()).await;
+        flood.abort();
+        worker.abort();
+        assert!(
+            matches!(update, Ok(Some(Message::Module(ModuleEvent::Network(Event::Snapshot(snapshot))))) if matches!(snapshot.state, 60 | 70))
+        );
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+
+    fn ap(path: &str, strength: u8, active: bool) -> Ap {
+        Ap {
+            path: path.into(),
+            ssid: "Home".into(),
+            strength,
+            security: "wpa2",
+            frequency: 2412,
+            active,
+            profile: Some("/profile".into()),
+        }
+    }
+
+    #[test]
+    fn deduplication_keeps_the_connected_bssid_even_when_a_sibling_is_stronger() {
+        let mut snapshot = Snapshot {
+            aps: vec![ap("/connected", 40, true), ap("/stronger", 80, false)],
+            ..Snapshot::default()
+        };
+        snapshot.sort_aps();
+        assert_eq!(snapshot.aps.len(), 1);
+        assert_eq!(snapshot.aps[0].path, "/connected");
+        assert!(snapshot.aps[0].active);
+    }
+
+    #[test]
+    fn deduplication_keeps_the_strongest_bssid_for_an_unconnected_network() {
+        let mut snapshot = Snapshot {
+            aps: vec![ap("/weak", 40, false), ap("/strong", 80, false)],
+            ..Snapshot::default()
+        };
+        snapshot.sort_aps();
+        assert_eq!(snapshot.aps[0].path, "/strong");
+    }
+
+    #[test]
+    fn secondary_wifi_connection_is_still_active_when_ethernet_is_primary() {
+        let snapshot = Snapshot {
+            primary: Some(Active {
+                kind: "802-3-ethernet".into(),
+                ..Active::default()
+            }),
+            secondary: vec![Active {
+                ap: Some(ApLink {
+                    path: "/wifi".into(),
+                    ..ApLink::default()
+                }),
+                ..Active::default()
+            }],
+            ..Snapshot::default()
+        };
+        assert!(snapshot.is_active_ap("/wifi"));
+        assert!(!snapshot.is_active_ap("/other"));
+    }
 }

@@ -312,6 +312,15 @@ macro_rules! modules {
             /// Tell each extension whether its popup is the one on screen, so a
             /// program only gathers popup detail while it can be seen.
             pub fn set_popup(&mut self, open: Option<ModuleId>) {
+                // Popup dismissal can originate at the compositor, output
+                // removal or another module. Transient gestures and destructive
+                // confirmations belong to the visible popup, not the next one.
+                if open != Some(ModuleId::Power) {
+                    let _ = self.power.update(power::Event::Dismiss);
+                }
+                if open != Some(ModuleId::Mpris) {
+                    let _ = self.mpris.update(mpris::Event::Dismiss);
+                }
                 for (index, state) in &mut self.extensions {
                     state.set_open(open == Some(ModuleId::Extension(*index)));
                 }

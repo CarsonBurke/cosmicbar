@@ -10,6 +10,7 @@
 //! The protocol lives in [`crate::extension`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cosmic::Element;
 use cosmic::app::Task;
@@ -23,16 +24,36 @@ use crate::modules::{Ctx, ModuleEvent};
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Started(tokio::sync::mpsc::Sender<Command>),
-    Frame(Arc<Frame>),
-    Stopped,
+    /// Source events carry the command revision across async delivery.
+    Source {
+        revision: u64,
+        event: extension::Event,
+    },
     /// A popup button was pressed; the extension decides what it means.
-    Press(String),
+    Press {
+        revision: u64,
+        run: u64,
+        action: String,
+    },
 }
 
 /// Island role: an extension is one flat cell beside its neighbours, the way
 /// the built-in single-cell modules are.
 pub const ISLAND: crate::theme::Island = crate::theme::Island::Flat;
+
+// Module indices are interned for the process lifetime, but module states can
+// disappear and be recreated. An epoch must never identify both incarnations.
+fn epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut current = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).expect("extension epochs exhausted");
+        match NEXT.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current,
+            Err(updated) => current = updated,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct State {
@@ -44,9 +65,14 @@ pub struct State {
     /// shared rather than cloned because iced rebuilds subscriptions after
     /// every message the bar handles.
     command: Arc<[String]>,
+    revision: u64,
+    run: u64,
     frame: Option<Arc<Frame>>,
     /// Pipe to the running program, absent while it is being restarted.
     commands: Option<tokio::sync::mpsc::Sender<Command>>,
+    /// A restarted process must supply its own frame before old controls can
+    /// become active; its action IDs may differ from the frame kept on screen.
+    ready: bool,
     /// Whether this module's popup is on screen. Kept here because the
     /// extension has to be *told*, and a restart has to be told again.
     open: bool,
@@ -57,8 +83,11 @@ impl State {
         Self {
             index,
             command,
+            revision: epoch(),
+            run: 0,
             frame: None,
             commands: None,
+            ready: false,
             open: false,
         }
     }
@@ -67,6 +96,11 @@ impl State {
     /// the command is unchanged; a different one restarts it on the next
     /// subscription rebuild, since the command is part of the identity.
     pub fn set_command(&mut self, command: Arc<[String]>) {
+        if self.command != command {
+            self.revision = epoch();
+            self.commands = None;
+            self.ready = false;
+        }
         self.command = command;
     }
 
@@ -75,22 +109,39 @@ impl State {
     /// extension the most expensive module on the bar. `open` reaches the
     /// program as a command instead.
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::run_with((self.index, self.command.clone()), spawn)
+        Subscription::run_with((self.index, self.revision, self.command.clone()), spawn)
     }
 
     pub fn update(&mut self, event: Event) -> Task<Message> {
         match event {
-            Event::Started(commands) => {
-                // A fresh process knows nothing about the popup it may have
-                // been restarted underneath.
-                let _ = commands.try_send(Command::Popup { popup: self.open });
-                self.commands = Some(commands);
+            Event::Source { revision, event } if revision == self.revision => match event {
+                extension::Event::Started(commands) => {
+                    self.run = epoch();
+                    self.ready = false;
+                    // A fresh process must learn whether its popup is open.
+                    let _ = commands.try_send(Command::Popup { popup: self.open });
+                    self.commands = Some(commands);
+                }
+                extension::Event::Frame(frame) => {
+                    self.frame = Some(frame);
+                    self.ready = true;
+                }
+                // Retain the last frame while restarting, with its controls disabled.
+                extension::Event::Stopped => {
+                    self.commands = None;
+                    self.ready = false;
+                }
+            },
+            Event::Press {
+                revision,
+                run,
+                action,
+            } if revision == self.revision && run == self.run && self.connected() => {
+                self.send(Command::Action { action });
             }
-            Event::Frame(frame) => self.frame = Some(frame),
-            // The last frame stays on screen: an extension being restarted is
-            // not a reason to make the bar jump.
-            Event::Stopped => self.commands = None,
-            Event::Press(action) => self.send(Command::Action { action }),
+            // Cancellation cannot retract an event already queued by the old
+            // subscription, nor a click from the view shown before a reload.
+            _ => {}
         }
         Task::none()
     }
@@ -115,6 +166,27 @@ impl State {
         }
     }
 
+    fn connected(&self) -> bool {
+        self.ready
+            && self
+                .commands
+                .as_ref()
+                .is_some_and(|commands| !commands.is_closed())
+    }
+
+    fn action_message(&self, action: &extension::Action) -> Option<Message> {
+        (action.enabled && self.connected()).then(|| {
+            Message::Module(ModuleEvent::Extension(
+                self.index,
+                Event::Press {
+                    revision: self.revision,
+                    run: self.run,
+                    action: action.id.clone(),
+                },
+            ))
+        })
+    }
+
     /// `None` hides the module: an extension with nothing to report takes no bar
     /// space, and neither does one whose program has never sent a frame.
     pub fn view(&self, ctx: &Ctx) -> Option<Element<'_, Message>> {
@@ -123,7 +195,11 @@ impl State {
             cell.glyph.as_str(),
             cell.text.as_str(),
             ctx.font_size,
-            cosmic::theme::Text::Color(cell.color.color(&ctx.palette)),
+            cosmic::theme::Text::Color(if self.connected() {
+                cell.color.color(&ctx.palette)
+            } else {
+                ctx.palette.muted()
+            }),
         ))
     }
 
@@ -142,7 +218,24 @@ impl State {
         }
         let mut card = crate::popup::Card::new();
         if let Some(header) = &frame.header {
-            card = card.block(self.row(header, ctx, true));
+            let header = self.row(header, ctx, true);
+            card = if self.connected() {
+                card.block(header)
+            } else {
+                card.block(
+                    crate::popup::lines()
+                        .push(header)
+                        .push(crate::popup::detail(
+                            "reconnecting · showing last update",
+                            ctx,
+                        )),
+                )
+            };
+        } else if !self.connected() {
+            card = card.block(crate::popup::detail(
+                "reconnecting · showing last update",
+                ctx,
+            ));
         }
         if !frame.popup.is_empty() {
             let mut list = crate::popup::column();
@@ -177,12 +270,7 @@ impl State {
                 action.label.as_str(),
                 style,
                 ctx,
-                action.enabled.then(|| {
-                    Message::Module(ModuleEvent::Extension(
-                        self.index,
-                        Event::Press(action.id.clone()),
-                    ))
-                }),
+                self.action_message(action),
             )
         });
         crate::popup::split(lines, action).into()
@@ -206,16 +294,255 @@ impl State {
 /// `Subscription::run_with` takes a plain function, so the name travels in the
 /// subscription's identity rather than in a captured variable — which is also
 /// what makes an edited command restart that one program and no others.
-fn spawn(input: &(u32, Arc<[String]>)) -> impl Stream<Item = Message> + use<> {
-    let index = input.0;
-    extension::stream(input.1.clone()).map(move |event| {
+fn spawn(input: &(u32, u64, Arc<[String]>)) -> impl Stream<Item = Message> + use<> {
+    let (index, revision, command) = input;
+    let (index, revision) = (*index, *revision);
+    extension::stream(command.clone()).map(move |event| {
         Message::Module(ModuleEvent::Extension(
             index,
-            match event {
-                extension::Event::Started(commands) => Event::Started(commands),
-                extension::Event::Frame(frame) => Event::Frame(frame),
-                extension::Event::Stopped => Event::Stopped,
-            },
+            Event::Source { revision, event },
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State::new(0, Arc::from(["test-extension".to_string()]))
+    }
+
+    fn frame() -> Arc<Frame> {
+        Arc::new(serde_json::from_str(r#"{"cell":{"text":"job running"},"header":{"lines":[{"text":"queue"}],"action":{"id":"pause","label":"pause"}}}"#).unwrap())
+    }
+
+    #[test]
+    fn stopped_extension_keeps_frame_but_disables_actions_until_restart_frame() {
+        let mut state = state();
+        let frame = frame();
+        let action = frame.header.as_ref().unwrap().action.as_ref().unwrap();
+        let (commands, mut inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        assert!(matches!(
+            inbox.try_recv().unwrap(),
+            Command::Popup { popup: false }
+        ));
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame.clone()),
+        });
+        assert!(state.action_message(action).is_some());
+        state.set_open(true);
+        assert!(matches!(
+            inbox.try_recv().unwrap(),
+            Command::Popup { popup: true }
+        ));
+        let _ = state.update(Event::Press {
+            revision: state.revision,
+            run: state.run,
+            action: "pause".into(),
+        });
+        assert!(
+            matches!(inbox.try_recv().unwrap(), Command::Action { action } if action == "pause")
+        );
+
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Stopped,
+        });
+        assert!(Arc::ptr_eq(state.frame.as_ref().unwrap(), &frame));
+        assert!(state.has_popup());
+        assert!(state.action_message(action).is_none());
+        let _ = state.update(Event::Press {
+            revision: state.revision,
+            run: state.run,
+            action: "pause".into(),
+        });
+        assert!(inbox.try_recv().is_err());
+
+        let (commands, mut inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        assert!(matches!(
+            inbox.try_recv().unwrap(),
+            Command::Popup { popup: true }
+        ));
+        assert!(state.action_message(action).is_none());
+        let _ = state.update(Event::Press {
+            revision: state.revision,
+            run: state.run,
+            action: "pause".into(),
+        });
+        assert!(inbox.try_recv().is_err());
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame.clone()),
+        });
+        assert!(state.action_message(action).is_some());
+        let _ = state.update(Event::Press {
+            revision: state.revision,
+            run: state.run,
+            action: "pause".into(),
+        });
+        assert!(
+            matches!(inbox.try_recv().unwrap(), Command::Action { action } if action == "pause")
+        );
+    }
+
+    #[test]
+    fn closed_command_pipe_and_reconfigured_process_disable_retained_actions() {
+        let mut state = state();
+        let frame = frame();
+        let action = frame.header.as_ref().unwrap().action.as_ref().unwrap();
+        let (commands, inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame.clone()),
+        });
+        assert!(state.action_message(action).is_some());
+        let disabled = extension::Action {
+            enabled: false,
+            ..action.clone()
+        };
+        assert!(state.action_message(&disabled).is_none());
+        drop(inbox);
+        assert!(state.action_message(action).is_none());
+
+        let (commands, _inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame.clone()),
+        });
+        state.set_command(Arc::from(["replacement-extension".to_string()]));
+        assert!(Arc::ptr_eq(state.frame.as_ref().unwrap(), &frame));
+        assert!(state.action_message(action).is_none());
+    }
+
+    #[test]
+    fn old_source_events_and_clicks_cannot_change_a_replacement_process() {
+        let mut state = state();
+        let old_revision = state.revision;
+        let old_frame = frame();
+        let action = old_frame.header.as_ref().unwrap().action.as_ref().unwrap();
+        let (old_commands, _old_inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: old_revision,
+            event: extension::Event::Started(old_commands.clone()),
+        });
+        let _ = state.update(Event::Source {
+            revision: old_revision,
+            event: extension::Event::Frame(old_frame.clone()),
+        });
+        let queued_click = state.action_message(action).unwrap();
+
+        state.set_command(Arc::from(["replacement-extension".to_string()]));
+        // Returning to the same command must still reject its previous lifetime.
+        state.set_command(Arc::from(["test-extension".to_string()]));
+        let new_frame = frame();
+        let (commands, mut inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = inbox.try_recv().unwrap();
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(new_frame.clone()),
+        });
+
+        for event in [
+            extension::Event::Started(old_commands),
+            extension::Event::Frame(old_frame),
+            extension::Event::Stopped,
+        ] {
+            let _ = state.update(Event::Source {
+                revision: old_revision,
+                event,
+            });
+            assert!(Arc::ptr_eq(state.frame.as_ref().unwrap(), &new_frame));
+            assert!(state.connected());
+        }
+        let Message::Module(ModuleEvent::Extension(_, event)) = queued_click else {
+            panic!("expected extension action");
+        };
+        let _ = state.update(event);
+        assert!(inbox.try_recv().is_err());
+        let _ = state.update(Event::Press {
+            revision: state.revision,
+            run: state.run,
+            action: "pause".into(),
+        });
+        assert!(
+            matches!(inbox.try_recv().unwrap(), Command::Action { action } if action == "pause")
+        );
+    }
+
+    #[test]
+    fn removed_and_readded_state_rejects_events_from_the_old_incarnation() {
+        let old = state();
+        let mut replacement = state();
+        assert_ne!(old.revision, replacement.revision);
+        let (commands, _inbox) = tokio::sync::mpsc::channel(4);
+        let _ = replacement.update(Event::Source {
+            revision: old.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = replacement.update(Event::Source {
+            revision: old.revision,
+            event: extension::Event::Frame(frame()),
+        });
+        assert!(replacement.commands.is_none());
+        assert!(replacement.frame.is_none());
+    }
+
+    #[test]
+    fn queued_click_from_previous_run_is_rejected_after_same_command_restarts() {
+        let mut state = state();
+        let frame = frame();
+        let (commands, _inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame.clone()),
+        });
+        let old_click = state
+            .action_message(frame.header.as_ref().unwrap().action.as_ref().unwrap())
+            .unwrap();
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Stopped,
+        });
+        let (commands, mut inbox) = tokio::sync::mpsc::channel(4);
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Started(commands),
+        });
+        let _ = inbox.try_recv().unwrap();
+        let _ = state.update(Event::Source {
+            revision: state.revision,
+            event: extension::Event::Frame(frame),
+        });
+        let Message::Module(ModuleEvent::Extension(_, event)) = old_click else {
+            panic!("expected extension action");
+        };
+        let _ = state.update(event);
+        assert!(inbox.try_recv().is_err());
+    }
 }

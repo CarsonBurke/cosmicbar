@@ -165,7 +165,11 @@ pub enum Action {
     PlayPause,
     Stop,
     /// Absolute position, in microseconds.
-    Seek(i64),
+    Seek {
+        position: i64,
+        track: Option<String>,
+        title: String,
+    },
     Shuffle(bool),
     /// One of MPRIS's `None`, `Track`, `Playlist`.
     Loop(&'static str),
@@ -186,10 +190,27 @@ pub enum Event {
     Scrub(u32),
     /// Seek bar released: commit wherever it was left.
     ScrubEnd,
+    Dismiss,
     /// Run `action` against the currently chosen player.
     Dispatch(Action),
     /// Result of a dispatch, so a refusal is visible instead of silent.
     Acted(Result<(), String>),
+}
+
+#[derive(Debug)]
+struct Scrub {
+    bus: String,
+    track: Option<String>,
+    title: String,
+    seconds: u32,
+}
+
+impl Scrub {
+    fn matches(&self, player: &Player) -> bool {
+        self.bus == player.bus
+            && self.track == player.track
+            && (self.track.is_some() || self.title == player.title)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -198,7 +219,8 @@ pub struct State {
     /// Bus name the user pinned in the popup; cleared when it disappears.
     selected: Option<String>,
     /// Seek target, in seconds, while the bar is being dragged.
-    scrub: Option<u32>,
+    scrub: Option<Scrub>,
+    scrub_cancelled: bool,
     error: Option<String>,
 }
 
@@ -208,7 +230,11 @@ impl State {
     /// while the popup is on screen and something is actually playing.
     pub fn subscription(&self, open: bool) -> Subscription<Message> {
         let live = Subscription::run(events).map(event_message);
-        match open && self.current().is_some_and(|player| player.status == Status::Playing) {
+        match open
+            && self
+                .current()
+                .is_some_and(|player| player.status == Status::Playing)
+        {
             true => Subscription::batch([
                 live,
                 cosmic::iced::time::every(RESYNC)
@@ -229,33 +255,69 @@ impl State {
                     self.selected = None;
                 }
                 self.players = players;
+                if self
+                    .scrub
+                    .as_ref()
+                    .is_some_and(|scrub| self.current().is_none_or(|player| !scrub.matches(player)))
+                {
+                    self.scrub = None;
+                    self.scrub_cancelled = true;
+                }
                 Task::none()
             }
             Event::Gone => {
+                self.scrub_cancelled |= self.scrub.is_some();
                 self.players = Arc::default();
                 self.selected = None;
                 self.scrub = None;
                 Task::none()
             }
             Event::Select(bus) => {
+                self.scrub_cancelled |= self.scrub.is_some();
                 self.selected = Some(bus);
                 self.scrub = None;
                 Task::none()
             }
             Event::Scrub(seconds) => {
-                self.scrub = Some(seconds);
+                if self.scrub_cancelled {
+                    return Task::none();
+                }
+                if let Some(player) = self.current() {
+                    self.scrub = Some(Scrub {
+                        bus: player.bus.clone(),
+                        track: player.track.clone(),
+                        title: player.title.clone(),
+                        seconds,
+                    });
+                }
                 Task::none()
             }
-            Event::ScrubEnd => match self.scrub.take() {
-                // The track can change under a drag; a target past the end of
-                // the new one would be refused or land somewhere absurd.
-                Some(seconds) => {
-                    let length = self.current().map_or(0, |player| player.length_us);
-                    let target = (i64::from(seconds) * 1_000_000).clamp(0, length);
-                    self.update(Event::Dispatch(Action::Seek(target)))
+            Event::Dismiss => {
+                self.scrub = None;
+                self.scrub_cancelled = false;
+                Task::none()
+            }
+            Event::ScrubEnd => {
+                self.scrub_cancelled = false;
+                match self.scrub.take() {
+                    // The track can change under a drag; a target past the end of
+                    // the new one would be refused or land somewhere absurd.
+                    Some(scrub) => {
+                        let Some(player) = self.current().filter(|player| scrub.matches(player))
+                        else {
+                            return Task::none();
+                        };
+                        let target = (i64::from(scrub.seconds) * 1_000_000)
+                            .clamp(0, player.length_us.max(0));
+                        self.update(Event::Dispatch(Action::Seek {
+                            position: target,
+                            track: scrub.track,
+                            title: scrub.title,
+                        }))
+                    }
+                    None => Task::none(),
                 }
-                None => Task::none(),
-            },
+            }
             Event::Dispatch(action) => {
                 let Some(bus) = self.current().map(|player| player.bus.clone()) else {
                     return Task::none();
@@ -348,8 +410,8 @@ impl State {
             let total = (player.length_us / 1_000_000).max(1) as u32;
             // While dragging, the bar and the clock follow the finger, not the
             // player: the seek is only sent on release.
-            let at = match self.scrub {
-                Some(seconds) => seconds.min(total),
+            let at = match &self.scrub {
+                Some(scrub) => scrub.seconds.min(total),
                 None => (played / 1_000_000).clamp(0, total as i64) as u32,
             };
             let seek: Element<'_, Message> = if player.can_seek {
@@ -367,7 +429,7 @@ impl State {
             };
             let elapsed = popup::detail(clock(i64::from(at) * 1_000_000), ctx);
             card = card.block(popup::column().push(seek).push(popup::split(
-                match self.scrub {
+                match &self.scrub {
                     Some(_) => elapsed.class(cosmic::theme::Text::Color(palette.accent())),
                     None => elapsed,
                 },
@@ -392,7 +454,12 @@ impl State {
                 // A player that can neither pause nor play has no transport.
                 (player.can_pause || player.can_play).then_some(Action::PlayPause),
             ),
-            control(ctx, NEXT, Chip::Plain, player.can_next.then_some(Action::Next)),
+            control(
+                ctx,
+                NEXT,
+                Chip::Plain,
+                player.can_next.then_some(Action::Next),
+            ),
             control(
                 ctx,
                 STOP,
@@ -573,11 +640,15 @@ enum Wire {
     Properties(BusMessage),
     Seeked(BusMessage),
     Request(Request),
+    Disconnected,
 }
 
 /// One bus connection's worth of players. Returns when the bus goes away.
 async fn session(events: &mut Events) -> zbus::Result<()> {
-    let connection = Connection::session().await?;
+    session_on(Connection::session().await?, events).await
+}
+
+async fn session_on(connection: Connection, events: &mut Events) -> zbus::Result<()> {
     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
 
     // Two match rules cover every player, present and future, so a new player
@@ -632,15 +703,27 @@ async fn session(events: &mut Events) -> zbus::Result<()> {
     publish(events, &players).await?;
 
     let mut wires = cosmic::iced::futures::stream::select_all([
-        names.map(Wire::Name).boxed(),
-        properties.filter_map(ok).map(Wire::Properties).boxed(),
-        seeked.filter_map(ok).map(Wire::Seeked).boxed(),
+        names
+            .map(Wire::Name)
+            .chain(futures::stream::once(async { Wire::Disconnected }))
+            .boxed(),
+        properties
+            .map(|message| message.map_or(Wire::Disconnected, Wire::Properties))
+            .chain(futures::stream::once(async { Wire::Disconnected }))
+            .boxed(),
+        seeked
+            .map(|message| message.map_or(Wire::Disconnected, Wire::Seeked))
+            .chain(futures::stream::once(async { Wire::Disconnected }))
+            .boxed(),
         requests.map(Wire::Request).boxed(),
     ]);
 
     while let Some(wire) = wires.next().await {
         let mut changed = false;
         match wire {
+            Wire::Disconnected => {
+                return Err(zbus::Error::Failure("session bus disconnected".into()));
+            }
             Wire::Name(signal) => {
                 let Ok(args) = signal.args() else { continue };
                 let name = args.name().as_str().to_owned();
@@ -687,10 +770,11 @@ async fn session(events: &mut Events) -> zbus::Result<()> {
                     }
                     changed = true;
                 } else if interface == ROOT_IFACE
-                    && let Some(identity) = updates.get("Identity").and_then(text) {
-                        player.identity = identity;
-                        changed = true;
-                    }
+                    && let Some(identity) = updates.get("Identity").and_then(text)
+                {
+                    player.identity = identity;
+                    changed = true;
+                }
             }
             Wire::Seeked(message) => {
                 let Some(bus) = sender_of(&message, &owners) else {
@@ -740,10 +824,6 @@ async fn publish(events: &mut Events, players: &BTreeMap<String, Player>) -> zbu
         .map_err(|_| zbus::Error::InputOutput(Arc::new(std::io::Error::other("bar gone"))))
 }
 
-fn ok(message: zbus::Result<BusMessage>) -> std::future::Ready<Option<BusMessage>> {
-    std::future::ready(message.ok())
-}
-
 /// Which player a signal came from. Signals carry the sender's unique name,
 /// which only the `NameOwnerChanged` bookkeeping can map back to a player.
 fn sender_of(message: &BusMessage, owners: &HashMap<String, String>) -> Option<String> {
@@ -781,7 +861,10 @@ async fn load(connection: &Connection, bus: &str) -> Option<Player> {
     }
     // A name on the bus that does not answer for the Player interface is not a
     // player the bar can drive.
-    let state = properties.get_all(PLAYER_IFACE.try_into().ok()?).await.ok()?;
+    let state = properties
+        .get_all(PLAYER_IFACE.try_into().ok()?)
+        .await
+        .ok()?;
     apply(&mut player, &state, now_ms());
     if !state.contains_key("Position") {
         resync(connection, &mut player).await;
@@ -882,6 +965,13 @@ async fn resync(connection: &Connection, player: &mut Player) {
 
 /// Call one MPRIS method, or set one MPRIS property.
 async fn act(connection: &Connection, player: &Player, action: &Action) -> zbus::Result<()> {
+    if let Action::Seek { track, title, .. } = action
+        && (track != &player.track || (track.is_none() && title != &player.title))
+    {
+        return Err(zbus::Error::Failure(
+            "Track changed before the seek could be sent".into(),
+        ));
+    }
     let proxy = Proxy::new(connection, player.bus.clone(), OBJECT_PATH, PLAYER_IFACE).await?;
     match action {
         Action::Next => proxy.call("Next", &()).await,
@@ -895,8 +985,11 @@ async fn act(connection: &Connection, player: &Player, action: &Action) -> zbus:
             .map_err(Into::into),
         // `SetPosition` is the only absolute seek, and it needs the track it
         // applies to; without a usable track id, fall back to a relative jump.
-        Action::Seek(target) => match player
-            .track
+        Action::Seek {
+            position: target,
+            track,
+            ..
+        } => match track
             .as_deref()
             .and_then(|track| ObjectPath::try_from(track).ok())
         {
@@ -981,11 +1074,139 @@ fn dictionary(value: &Value<'_>) -> HashMap<String, Value<'static>> {
     match value {
         Value::Dict(dict) => dict
             .iter()
-            .filter_map(|(key, entry)| {
-                Some((text_value(key)?, entry.try_to_owned().ok()?.into()))
-            })
+            .filter_map(|(key, entry)| Some((text_value(key)?, entry.try_to_owned().ok()?.into())))
             .collect(),
         Value::Value(inner) => dictionary(inner),
         _ => HashMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn playing(bus: &str, track: &str) -> Player {
+        Player {
+            bus: bus.into(),
+            track: Some(track.into()),
+            status: Status::Playing,
+            length_us: 100_000_000,
+            ..Player::default()
+        }
+    }
+
+    #[test]
+    fn changing_track_or_automatic_player_cancels_a_seek_gesture() {
+        for replacement in [playing("A", "/next"), playing("B", "/same")] {
+            let mut state = State::default();
+            let _ = state.update(Event::Players(Arc::new(vec![playing("A", "/same")])));
+            let _ = state.update(Event::Scrub(35));
+            assert!(state.scrub.is_some());
+            let _ = state.update(Event::Players(Arc::new(vec![replacement])));
+            assert!(state.scrub.is_none());
+            let _ = state.update(Event::Scrub(40));
+            assert!(
+                state.scrub.is_none(),
+                "same drag must not retarget a new track"
+            );
+            let _ = state.update(Event::ScrubEnd);
+            let _ = state.update(Event::Scrub(40));
+            assert!(state.scrub.is_some(), "a new drag can target the new track");
+        }
+    }
+
+    #[test]
+    fn dismissing_a_cancelled_seek_allows_a_new_popup_gesture() {
+        let mut state = State::default();
+        let _ = state.update(Event::Players(Arc::new(vec![playing("A", "/same")])));
+        let _ = state.update(Event::Scrub(35));
+        let _ = state.update(Event::Players(Arc::new(vec![playing("A", "/next")])));
+        assert!(state.scrub_cancelled);
+        let mut modules = crate::modules::Modules {
+            mpris: state,
+            ..Default::default()
+        };
+        modules.set_popup(None);
+        let _ = modules.mpris.update(Event::Scrub(40));
+        assert!(modules.mpris.scrub.is_some());
+        assert!(!modules.mpris.scrub_cancelled);
+    }
+
+    #[test]
+    fn position_updates_preserve_a_seek_on_the_same_track() {
+        let mut state = State::default();
+        let _ = state.update(Event::Players(Arc::new(vec![playing("A", "/same")])));
+        let _ = state.update(Event::Scrub(35));
+        let mut update = playing("A", "/same");
+        update.position_us = 9_000_000;
+        let _ = state.update(Event::Players(Arc::new(vec![update])));
+        assert_eq!(state.scrub.as_ref().map(|scrub| scrub.seconds), Some(35));
+    }
+
+    #[tokio::test]
+    async fn queued_seek_rejects_a_track_changed_before_worker_dispatch() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut daemon = tokio::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .await
+            .unwrap();
+        let connection = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let seek = Action::Seek {
+            position: 35_000_000,
+            track: Some("/original".into()),
+            title: String::new(),
+        };
+        let changed = playing("org.mpris.MediaPlayer2.example", "/next");
+        let error = act(&connection, &changed, &seek).await.unwrap_err();
+        assert!(error.to_string().contains("Track changed"));
+        connection.close().await.unwrap();
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_bus_ends_the_session_even_with_the_request_sender_alive() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut daemon = tokio::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut address = String::new();
+        BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut address)
+            .await
+            .unwrap();
+        let connection = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let (mut sender, mut receiver) = cosmic::iced::futures::channel::mpsc::channel(8);
+        let closing = connection.clone();
+        let worker = tokio::spawn(async move { session_on(connection, &mut sender).await });
+        assert!(matches!(receiver.next().await, Some(Event::Players(_))));
+        closing.close().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
     }
 }

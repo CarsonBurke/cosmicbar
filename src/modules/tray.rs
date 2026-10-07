@@ -903,7 +903,7 @@ fn pixmap_handle(pixmaps: Option<&[IconPixmap]>, target: u32) -> Option<icon::Ha
     let width = best.width as u32;
     let height = best.height as u32;
     let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
-    for argb in best.pixels.chunks_exact(4).take((width * height) as usize) {
+    for argb in best.pixels.as_chunks::<4>().0.iter().take((width * height) as usize) {
         rgba.extend_from_slice(&[argb[1], argb[2], argb[3], argb[0]]);
     }
     Some(icon::from_raster_pixels(width, height, rgba))
@@ -1244,12 +1244,21 @@ async fn session(
                 Ok(received) => received,
                 Err(_) => {
                     settling = false;
+                    // Failed initial items are not a failed host: the client
+                    // keeps listening for registrations. Reconnecting here
+                    // would repeatedly clear the tray and create fresh hosts
+                    // whenever the registry only contains unavailable items.
+                    let registered = watcher.registered_status_notifier_items().await?;
+                    let expected: Vec<_> = expected
+                        .iter()
+                        .filter(|address| {
+                            registered
+                                .iter()
+                                .any(|entry| entry_destination(entry) == address.as_ref())
+                        })
+                        .cloned()
+                        .collect();
                     let unannounced = unannounced_items(&client, &expected, &announced);
-                    anyhow::ensure!(
-                        !announced.is_empty() || !unannounced.is_empty(),
-                        "watcher lists {} item(s) the tray client never loaded",
-                        expected.len()
-                    );
                     for (address, item, menu) in unannounced {
                         log::debug!("tray: seeding {address} from the watcher registry");
                         if sender

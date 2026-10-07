@@ -313,14 +313,14 @@ async fn builtin_watcher_removes_disconnected_items() {
         .unwrap();
     next_matching(
         &mut events,
-        |event| matches!(event, Event::Added(found, _) if &**found == address),
+        |event| matches!(event, Event::Added(found, _) if **found == address),
     )
     .await;
     drop(watcher);
     app.close().await.unwrap();
     next_matching(
         &mut events,
-        |event| matches!(event, Event::Removed(found) if &**found == address),
+        |event| matches!(event, Event::Removed(found) if **found == address),
     )
     .await;
     task.abort();
@@ -481,5 +481,65 @@ async fn transient_discovery_failure_is_retried() {
     drop(state.update(added));
     assert_eq!(state.item(address).unwrap().id, "tray-lifecycle-test");
     export.await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn unavailable_initial_items_do_not_end_the_session() {
+    if !private_bus_child("unavailable_initial_items_do_not_end_the_session") {
+        return;
+    }
+    let watcher = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.kde.StatusNotifierWatcher")
+        .unwrap()
+        .serve_at("/StatusNotifierWatcher", Registry::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let control = zbus::Proxy::new(
+        &watcher,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.kde.StatusNotifierWatcher",
+    )
+    .await
+    .unwrap();
+    let app = zbus::connection::Builder::session()
+        .unwrap()
+        .serve_at(ITEM_OBJECT, TrayApp)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let address = app.unique_name().unwrap().as_str();
+    let missing = format!("{address}/NotExported");
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&missing,))
+        .await
+        .unwrap();
+    let (mut sender, mut events) = cosmic::iced::futures::channel::mpsc::channel(32);
+    let task = tokio::spawn(async move { session(&mut sender).await.unwrap() });
+    next_matching(&mut events, |event| matches!(event, Event::Connected(_))).await;
+    // The initial registry contains no loadable item. Crossing the settling
+    // deadline must leave the same host listening, rather than end its stream.
+    assert!(
+        tokio::time::timeout(INITIAL_LOAD + Duration::from_millis(100), events.next())
+            .await
+            .is_err(),
+        "an unavailable initial item ended the host session"
+    );
+    let healthy = format!("{address}{ITEM_OBJECT}");
+    control
+        .call::<_, _, ()>("RegisterStatusNotifierItem", &(&healthy,))
+        .await
+        .unwrap();
+    next_matching(
+        &mut events,
+        |event| matches!(event, Event::Added(found, _) if &**found == address),
+    )
+    .await;
+    assert!(!task.is_finished());
     task.abort();
 }

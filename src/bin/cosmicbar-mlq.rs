@@ -480,8 +480,11 @@ impl Extension {
         let paused = status["paused"].as_bool().unwrap_or(false);
         if let Some(job) = headline {
             let mut text = elide(name(job), NAME_LIMIT);
-            if active > 1 {
-                text.push_str(&format!(" +{}", active - 1));
+            // Everything else running or queued behind it; held and lost jobs
+            // are not coming, so they stay out of the count.
+            let others = active - 1 + pending;
+            if others > 0 {
+                text.push_str(&format!(" +{others}"));
             }
             text.push_str(&format!(" · {}", duration(self.elapsed_ms(job, now))));
             json!({"glyph": ICON, "text": text, "color": if self.connected { "green" } else { "muted" }})
@@ -1068,6 +1071,26 @@ mod tests {
         assert_eq!(cell(json!([held, queued])).as_deref(), Some("1 queued"));
         assert_eq!(cell(json!([held, queued, lost])).as_deref(), Some("1 lost"));
         assert_eq!(cell(json!([])), None);
+    }
+
+    #[test]
+    fn a_busy_cell_counts_the_rest_of_the_queue() {
+        let cell = |jobs: Value| {
+            let text = Extension::default().cell(&json!({"jobs": jobs}), now_ms())["text"]
+                .as_str()
+                .map(str::to_owned);
+            text.map(|text| text.split(" · ").next().unwrap().to_owned())
+        };
+        let running = |id| json!({"id": id, "name": "ppo", "state": "running"});
+        let queued = json!({"id": 3, "state": "queued"});
+        let held = json!({"id": 4, "state": "held"});
+        let lost = json!({"id": 5, "state": "needs_attention"});
+        assert_eq!(cell(json!([running(1)])).as_deref(), Some("ppo"));
+        assert_eq!(cell(json!([running(1), queued])).as_deref(), Some("ppo +1"));
+        assert_eq!(
+            cell(json!([running(1), running(2), queued, held, lost])).as_deref(),
+            Some("ppo +2")
+        );
     }
 
     #[test]

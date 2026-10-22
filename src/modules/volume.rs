@@ -188,6 +188,7 @@ pub enum Event {
     Sent,
     Expire(Kind, u32, Instant),
     Rejected(Kind, u32, Instant),
+    MuteRejected,
     /// A command could not be handed over at all.
     Failed(String),
 }
@@ -349,6 +350,10 @@ impl State {
             Event::Failed(error) => {
                 self.targets.clear();
                 self.error = Some(error);
+                Task::none()
+            }
+            Event::MuteRejected => {
+                self.error = Some("Audio server refused the mute change".into());
                 Task::none()
             }
         }
@@ -668,6 +673,8 @@ fn elide(text: &str, limit: usize) -> String {
 /// What the bar asks the pulse thread to do.
 #[derive(Debug)]
 enum Command {
+    /// Failed subscription or snapshot: reconnect rather than keep stale state.
+    SessionFailed(&'static str),
     /// A subscription event: re-read this facility.
     Dirty(Option<Facility>),
     /// Re-read everything, for a fresh listener.
@@ -701,7 +708,7 @@ impl Command {
             Self::Mute { kind, index, .. } => Some((1, *kind, *index)),
             Self::Default { kind, .. } => Some((2, *kind, 0)),
             // Refresh requests fold into a facility set instead.
-            Self::Dirty(_) | Self::Resync | Self::State => None,
+            Self::Dirty(_) | Self::Resync | Self::State | Self::SessionFailed(_) => None,
         }
     }
 }
@@ -835,9 +842,11 @@ fn session(commands: &Receiver<Command>, waker: &Sender<Command>) -> Result<(), 
 
     let outcome = run(&mut mainloop, &mut context, commands, waker);
 
+    mainloop.lock();
     context.set_state_callback(None);
     context.set_subscribe_callback(None);
     context.disconnect();
+    mainloop.unlock();
     mainloop.stop();
     outcome
 }
@@ -875,14 +884,19 @@ fn run(
     })));
     // SERVER carries default-device changes; SINK_INPUT the per-application
     // streams the popup mixes.
+    let subscription_waker = waker.clone();
     let _ = context.subscribe(
         InterestMaskSet::SINK
             | InterestMaskSet::SOURCE
             | InterestMaskSet::SERVER
             | InterestMaskSet::SINK_INPUT,
-        |_success| {},
+        move |success| {
+            if !success {
+                let _ = subscription_waker.send(Command::SessionFailed("subscription refused"));
+            }
+        },
     );
-    refresh(&context.introspect(), Refresh::ALL);
+    refresh(&context.introspect(), Refresh::ALL, waker);
     mainloop.unlock();
 
     let mut batch: Vec<Command> = Vec::new();
@@ -896,6 +910,13 @@ fn run(
         }
         coalesce(&mut batch);
 
+        if let Some(error) = batch.iter().find_map(|command| match command {
+            Command::SessionFailed(error) => Some(*error),
+            _ => None,
+        }) {
+            return Err(error.into());
+        }
+
         mainloop.lock();
         if context.get_state() != ContextState::Ready {
             mainloop.unlock();
@@ -905,6 +926,7 @@ fn run(
         for command in batch.drain(..) {
             match command {
                 Command::State => {}
+                Command::SessionFailed(_) => unreachable!("handled before locking the mainloop"),
                 Command::Dirty(facility) => wanted |= Refresh::of(facility),
                 Command::Resync => wanted |= Refresh::ALL,
                 Command::Volume {
@@ -945,13 +967,25 @@ fn run(
                     let mut introspect = context.introspect();
                     match kind {
                         Kind::Sink => {
-                            introspect.set_sink_mute_by_index(index, mute, None);
+                            introspect.set_sink_mute_by_index(
+                                index,
+                                mute,
+                                Some(mute_result(kind, waker)),
+                            );
                         }
                         Kind::Source => {
-                            introspect.set_source_mute_by_index(index, mute, None);
+                            introspect.set_source_mute_by_index(
+                                index,
+                                mute,
+                                Some(mute_result(kind, waker)),
+                            );
                         }
                         Kind::Stream => {
-                            introspect.set_sink_input_mute(index, mute, None);
+                            introspect.set_sink_input_mute(
+                                index,
+                                mute,
+                                Some(mute_result(kind, waker)),
+                            );
                         }
                     }
                 }
@@ -966,10 +1000,27 @@ fn run(
             }
         }
         if wanted != Refresh::NONE {
-            refresh(&context.introspect(), wanted);
+            refresh(&context.introspect(), wanted, waker);
         }
         mainloop.unlock();
     }
+}
+
+/// Read back an acknowledged mute write even if no subscription event arrives.
+fn mute_result(kind: Kind, waker: &Sender<Command>) -> Box<dyn FnMut(bool)> {
+    let waker = waker.clone();
+    Box::new(move |success| {
+        if success {
+            let facility = match kind {
+                Kind::Sink => Facility::Sink,
+                Kind::Source => Facility::Source,
+                Kind::Stream => Facility::SinkInput,
+            };
+            let _ = waker.send(Command::Dirty(Some(facility)));
+        } else {
+            PULSE.emit(Event::MuteRejected);
+        }
+    })
 }
 
 /// Report a refused write even when it produces no subscription event.
@@ -1042,7 +1093,7 @@ impl std::ops::BitOrAssign for Refresh {
 
 /// Issue the introspection queries for `wanted`. Each result callback owns its
 /// own accumulator and emits one snapshot when the list ends.
-fn refresh(introspect: &Introspector, wanted: Refresh) {
+fn refresh(introspect: &Introspector, wanted: Refresh, waker: &Sender<Command>) {
     if wanted.has(Refresh::SERVER) {
         let _ = introspect.get_server_info(|info| {
             PULSE.emit(Event::Server {
@@ -1053,14 +1104,18 @@ fn refresh(introspect: &Introspector, wanted: Refresh) {
     }
     if wanted.has(Refresh::SINKS) {
         let mut devices = Vec::new();
+        let waker = waker.clone();
         let _ = introspect.get_sink_info_list(move |result| match result {
             ListResult::Item(info) => devices.push(sink_device(info)),
             ListResult::End => PULSE.emit(Event::Sinks(Arc::new(std::mem::take(&mut devices)))),
-            ListResult::Error => devices.clear(),
+            ListResult::Error => {
+                let _ = waker.send(Command::SessionFailed("sink snapshot failed"));
+            }
         });
     }
     if wanted.has(Refresh::SOURCES) {
         let mut devices = Vec::new();
+        let waker = waker.clone();
         let _ = introspect.get_source_info_list(move |result| match result {
             // A monitor source is a sink's loopback, never something you would
             // pick as a microphone.
@@ -1069,15 +1124,20 @@ fn refresh(introspect: &Introspector, wanted: Refresh) {
             }
             ListResult::Item(_) => {}
             ListResult::End => PULSE.emit(Event::Sources(Arc::new(std::mem::take(&mut devices)))),
-            ListResult::Error => devices.clear(),
+            ListResult::Error => {
+                let _ = waker.send(Command::SessionFailed("source snapshot failed"));
+            }
         });
     }
     if wanted.has(Refresh::STREAMS) {
         let mut streams = Vec::new();
+        let waker = waker.clone();
         let _ = introspect.get_sink_input_info_list(move |result| match result {
             ListResult::Item(info) => streams.push(app_stream(info)),
             ListResult::End => PULSE.emit(Event::Streams(Arc::new(std::mem::take(&mut streams)))),
-            ListResult::Error => streams.clear(),
+            ListResult::Error => {
+                let _ = waker.send(Command::SessionFailed("stream snapshot failed"));
+            }
         });
     }
 }
@@ -1164,6 +1224,60 @@ fn from_pct(pct: u32) -> Volume {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn acknowledged_mute_writes_refresh_the_affected_facility() {
+        let (waker, commands) = mpsc::channel();
+        for (kind, expected) in [
+            (Kind::Sink, Facility::Sink),
+            (Kind::Source, Facility::Source),
+            (Kind::Stream, Facility::SinkInput),
+        ] {
+            mute_result(kind, &waker)(true);
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(Command::Dirty(Some(facility))) if facility == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn a_refused_mute_write_does_not_discard_pending_volume_changes() {
+        let mut state = State::default();
+        state
+            .targets
+            .insert((Kind::Source, 1), (60, TARGET_PATIENCE, Instant::now()));
+        let _ = state.update(Event::MuteRejected);
+        assert_eq!(state.target(Kind::Source, 1), Some(60));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Audio server refused the mute change")
+        );
+    }
+
+    #[test]
+    fn coalescing_writes_preserves_session_failures() {
+        let mut batch = vec![
+            Command::SessionFailed("source snapshot failed"),
+            Command::Mute {
+                kind: Kind::Source,
+                index: 1,
+                mute: false,
+            },
+            Command::Mute {
+                kind: Kind::Source,
+                index: 1,
+                mute: true,
+            },
+        ];
+        coalesce(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(
+            batch[0],
+            Command::SessionFailed("source snapshot failed")
+        ));
+        assert!(matches!(batch[1], Command::Mute { mute: true, .. }));
+    }
 
     #[test]
     fn an_old_timeout_cannot_discard_a_newer_volume_target() {

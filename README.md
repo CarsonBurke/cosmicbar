@@ -122,8 +122,10 @@ Three cells have nothing to open: `workspaces` and `idle_inhibitor` act on the
 click itself, and `time` says all it has to say in the bar.
 
 The center region stays centered when it fits between the edges. On narrow
-outputs it moves into the free space; if the regions still cannot fit, each
-gets a separate horizontal scroll area. Scroll over passive cells or drag the
+outputs it moves into the free space; if the regions still cannot fit, the left
+region (the app list) gives up its width first, down to a single cell, before
+the center and right regions shrink. Each region that does not fit gets a
+separate horizontal scroll area. Scroll over passive cells or drag the
 small scrollbar to reach hidden controls. Volume and brightness retain their
 normal wheel actions, and popups follow the visible part of a scrolled cell.
 

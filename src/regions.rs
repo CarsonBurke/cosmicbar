@@ -1,8 +1,11 @@
 //! Measured bar regions: centered when possible, constrained to the free gap.
 //!
 //! Each region has its own horizontal scroll viewport. If content cannot fit,
-//! large regions share a width cap while small regions keep their natural size;
-//! scrolling reveals the rest without painting or clicking into a neighbour.
+//! the left region (the app list, which grows with every window) gives up its
+//! width first; only once it is down to an even share do the other regions
+//! shrink, large regions sharing a width cap while small ones keep their natural
+//! size. Scrolling reveals the rest without painting or clicking into a
+//! neighbour.
 
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer};
@@ -180,7 +183,9 @@ struct Placement {
 }
 
 /// Widths come from the widgets' real layout, including font shaping and padding.
-fn placement(width: f32, natural: [f32; 3]) -> Placement {
+/// `left_floor` is the width the left region keeps however crowded the bar is,
+/// so it stays visible and can still be scrolled.
+fn placement(width: f32, natural: [f32; 3], left_floor: f32) -> Placement {
     let count = natural.iter().filter(|&&width| width > 0.0).count();
     let gap = if count > 1 {
         GAP.min(width / (count - 1) as f32)
@@ -188,18 +193,17 @@ fn placement(width: f32, natural: [f32; 3]) -> Placement {
         0.0
     };
     let available = (width - gap * count.saturating_sub(1) as f32).max(0.0);
-    let mut sorted = natural;
-    sorted.sort_by(f32::total_cmp);
-    let mut remaining = available;
-    let mut cap = 0.0;
-    for (index, natural) in sorted.into_iter().enumerate() {
-        cap = remaining / (3 - index) as f32;
-        if natural > cap {
-            break;
-        }
-        remaining -= natural;
-    }
-    let widths = natural.map(|natural| natural.min(cap));
+    // The left region holds the app list, which grows with every window, so it
+    // overflows first: the center and right regions are fitted to what it
+    // leaves above its floor, and it takes whatever they do not use.
+    let left_floor = natural[0].min(left_floor).min(available);
+    let cap = share_cap(available - left_floor, &natural[1..]);
+    let [center_width, right_width] = [natural[1].min(cap), natural[2].min(cap)];
+    let widths = [
+        natural[0].min(available - center_width - right_width),
+        center_width,
+        right_width,
+    ];
     let left = if widths[0] > 0.0 {
         widths[0] + gap
     } else {
@@ -213,6 +217,23 @@ fn placement(width: f32, natural: [f32; 3]) -> Placement {
         x: [0.0, center, (width - widths[2]).max(0.0)],
         widths,
     }
+}
+
+/// The largest cap that fits `natural` widths, capped, into `available`:
+/// regions under it keep their natural width and the rest share what is left.
+fn share_cap(available: f32, natural: &[f32]) -> f32 {
+    let mut sorted = natural.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut remaining = available;
+    let mut cap = 0.0;
+    for (index, &natural) in sorted.iter().enumerate() {
+        cap = remaining / (sorted.len() - index) as f32;
+        if natural > cap {
+            break;
+        }
+        remaining -= natural;
+    }
+    cap
 }
 
 impl Widget<Message, Theme, Renderer> for Regions<'_> {
@@ -245,7 +266,8 @@ impl Widget<Message, Theme, Renderer> for Regions<'_> {
             .map(|(child, state)| child.as_widget_mut().layout(state, renderer, &measure))
             .collect();
         let natural = std::array::from_fn(|index| nodes[index].size().width);
-        let placement = placement(size.width, natural);
+        // One bar-height cell: room for the launcher badge or a single app icon.
+        let placement = placement(size.width, natural, self.height);
         for (index, ((child, state), node)) in self
             .children
             .iter_mut()
@@ -481,25 +503,40 @@ mod tests {
 
     #[test]
     fn center_stays_at_output_midpoint_when_it_fits() {
-        let plan = placement(1000.0, [100.0, 200.0, 250.0]);
+        let plan = placement(1000.0, [100.0, 200.0, 250.0], 24.0);
         assert_eq!(plan.x, [0.0, 400.0, 750.0]);
         assert_eq!(plan.widths, [100.0, 200.0, 250.0]);
     }
 
     #[test]
     fn asymmetric_edges_shift_center_without_shrinking_content_that_fits() {
-        let plan = placement(952.0, [60.0, 200.0, 600.0]);
+        let plan = placement(952.0, [60.0, 200.0, 600.0], 24.0);
         assert_eq!(plan.x, [0.0, 146.0, 352.0]);
         assert_eq!(plan.widths, [60.0, 200.0, 600.0]);
-        let mirror = placement(952.0, [600.0, 200.0, 60.0]);
+        let mirror = placement(952.0, [600.0, 200.0, 60.0], 24.0);
         assert_eq!(mirror.x, [0.0, 606.0, 892.0]);
     }
 
     #[test]
-    fn overflow_preserves_small_regions_and_caps_larger_regions_without_overlap() {
-        let plan = placement(600.0, [50.0, 400.0, 800.0]);
-        assert_eq!(plan.widths, [50.0, 269.0, 269.0]);
-        assert_eq!(plan.x, [0.0, 56.0, 331.0]);
+    fn left_region_overflows_before_center_or_right_shrink() {
+        // A long app list used to take an even share and squeeze the center.
+        let plan = placement(1000.0, [700.0, 450.0, 250.0], 24.0);
+        assert_eq!(plan.widths, [288.0, 450.0, 250.0]);
+        assert_eq!(plan.x, [0.0, 294.0, 750.0]);
+    }
+
+    #[test]
+    fn edges_share_a_cap_once_the_left_region_is_down_to_its_floor() {
+        let plan = placement(600.0, [50.0, 400.0, 800.0], 24.0);
+        assert_eq!(plan.widths, [24.0, 282.0, 282.0]);
+        assert_eq!(plan.x, [0.0, 30.0, 318.0]);
+        // A left region already under the floor keeps its natural width.
+        let plan = placement(600.0, [20.0, 400.0, 800.0], 24.0);
+        assert_eq!(plan.widths, [20.0, 284.0, 284.0]);
+    }
+
+    #[test]
+    fn overflow_never_overlaps_or_leaves_the_bar() {
         for width in [0.0, 1.0, 4.0, 12.0, 50.0, 200.0, 1200.0] {
             for natural in [
                 [0.0, 0.0, 0.0],
@@ -507,14 +544,18 @@ mod tests {
                 [0.0, 200.0, 400.0],
                 [200.0, 400.0, 0.0],
                 [200.0, 400.0, 800.0],
+                [900.0, 400.0, 300.0],
             ] {
-                let plan = placement(width, natural);
-                for i in 0..3 {
-                    assert!(plan.x[i] >= 0.0);
-                    assert!(plan.x[i] + plan.widths[i] <= width + 0.001);
-                    for j in i + 1..3 {
-                        if plan.widths[i] > 0.0 && plan.widths[j] > 0.0 {
-                            assert!(plan.x[i] + plan.widths[i] <= plan.x[j] + 0.001);
+                for left_floor in [0.0, 24.0, 2000.0] {
+                    let plan = placement(width, natural, left_floor);
+                    for i in 0..3 {
+                        assert!(plan.widths[i] >= 0.0);
+                        assert!(plan.x[i] >= 0.0);
+                        assert!(plan.x[i] + plan.widths[i] <= width + 0.001);
+                        for j in i + 1..3 {
+                            if plan.widths[i] > 0.0 && plan.widths[j] > 0.0 {
+                                assert!(plan.x[i] + plan.widths[i] <= plan.x[j] + 0.001);
+                            }
                         }
                     }
                 }

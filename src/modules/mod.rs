@@ -202,6 +202,13 @@ macro_rules! modules {
                 Self::ALL.iter().copied().find(|id| id.name() == name)
             }
 
+            /// Whether the module's content grows without bound: its island
+            /// scrolls inside its own pill and gives up width before anything
+            /// else in its region does.
+            pub fn overflows(self) -> bool {
+                self == Self::Taskbar
+            }
+
             /// Island background role, mirroring the waybar colour chain.
             pub fn island(self) -> Island {
                 match self {

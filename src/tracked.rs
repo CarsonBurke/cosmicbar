@@ -356,13 +356,12 @@ mod tests {
             .push(tracker.container(
                 (parent, ModuleId::Memory),
                 button(200.0, parent, ModuleId::Memory),
-            ))
-            .into();
+            ));
         let mut content = crate::regions::regions(
             [
-                left,
-                button(50.0, parent, ModuleId::Date),
-                button(50.0, parent, ModuleId::Power),
+                Element::from(left).into(),
+                button(50.0, parent, ModuleId::Date).into(),
+                button(50.0, parent, ModuleId::Power).into(),
             ],
             24.0,
         );

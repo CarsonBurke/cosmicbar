@@ -607,13 +607,8 @@ impl Bar {
         surface: SurfaceId,
         ids: &'a [ModuleId],
         ctx: &Ctx,
-    ) -> Element<'a, Message> {
-        let height = Length::Fixed(self.config.height as f32);
-        let mut row = widget::Row::new()
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .height(height);
-
+    ) -> crate::regions::Region<'a> {
+        let mut region = crate::regions::Region::default();
         let mut group: Vec<(ModuleId, Element<'a, Message>)> = Vec::new();
         let mut group_island = None;
 
@@ -626,15 +621,19 @@ impl Bar {
             // and opens its own. There has to be an island to continue: first in
             // the region, or after a module that paints none, a `Join` opens one
             // rather than losing its background to a neighbour that has none.
+            // Nor does it join the app list's island: crowded, that island
+            // hands all its width to the list, and would crush the newcomer.
             let joins = island == crate::theme::Island::Join
-                && group_island == Some(crate::theme::Island::Start);
+                && group_island == Some(crate::theme::Island::Start)
+                && !group.iter().any(|&(id, _)| id.overflows());
             if !joins && !group.is_empty() {
-                row = row.push(self.island_group(
+                self.push_island(
+                    &mut region,
                     surface,
                     group_island,
                     std::mem::take(&mut group),
                     ctx,
-                ));
+                );
             }
             if !joins {
                 group_island = Some(island.opened());
@@ -642,14 +641,28 @@ impl Bar {
             group.push((id, content));
         }
         if !group.is_empty() {
-            row = row.push(self.island_group(surface, group_island, group, ctx));
+            self.push_island(&mut region, surface, group_island, group, ctx);
         }
 
-        row.into()
+        region
+    }
+
+    fn push_island<'a>(
+        &'a self,
+        region: &mut crate::regions::Region<'a>,
+        surface: SurfaceId,
+        island: Option<crate::theme::Island>,
+        members: Vec<(ModuleId, Element<'a, Message>)>,
+        ctx: &Ctx,
+    ) {
+        let overflows = members.iter().any(|&(id, _)| id.overflows());
+        let island = self.island_group(region, surface, island, members, ctx);
+        region.push(island, overflows);
     }
 
     fn island_group<'a>(
         &'a self,
+        region: &crate::regions::Region<'a>,
         surface: SurfaceId,
         island: Option<crate::theme::Island>,
         members: Vec<(ModuleId, Element<'a, Message>)>,
@@ -666,6 +679,12 @@ impl Bar {
         let mut inner = widget::Row::new().align_y(Alignment::Center).height(height);
 
         for (index, (id, content)) in members.into_iter().enumerate() {
+            // Scrolls inside the cell's padding, under the island's rounding.
+            let content = if id.overflows() {
+                region.overflow(content, self.config.height as f32)
+            } else {
+                content
+            };
             let radius = match (index == 0, index == last) {
                 (true, true) => [crate::theme::ISLAND_RADIUS; 4],
                 (true, false) => [
